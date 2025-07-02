@@ -11,7 +11,6 @@ import glob
 from constants import HEIGHT, WIDTH
 from utils import create_heatmap, custom_loss, OutcomeMetricsCallback
 
-
 # Import get_model function
 def get_model(model_name, height, width):
     """
@@ -20,10 +19,13 @@ def get_model(model_name, height, width):
     from model.VballNetFastV1 import VballNetFastV1
     from model.VballNetV1 import VballNetV1
 
+    if model_name == 'PlayerNetFastV1':
+        from model.PlayerNetFastV1 import PlayerNetFastV1
+        return PlayerNetFastV1(input_shape=(9, height, width), output_channels=3)
+
     if model_name == "VballNetFastV1":
         return VballNetFastV1(height, width, in_dim=9, out_dim=3)
     return VballNetV1(height, width, in_dim=9, out_dim=3)
-
 
 # Parameters
 IMG_HEIGHT = HEIGHT  # 288
@@ -35,7 +37,6 @@ SIGMA = 5  # Radius for circular heatmap
 MAG = 1.0  # Magnitude for heatmap
 RATIO = 1.0  # Scaling factor for coordinates
 MODEL_DIR = "models"  # Directory for model saving
-
 
 # Configure logging
 def setup_logging(debug=False):
@@ -50,8 +51,6 @@ def setup_logging(debug=False):
     )
     logger = logging.getLogger(__name__)
     return logger
-
-
 def load_image_frames(track_id, frame_indices, mode, height=288, width=512):
     """
     Loads seq preprocessed image frames from DATASET_DIR/mode/track_id/.
@@ -75,14 +74,8 @@ def load_image_frames(track_id, frame_indices, mode, height=288, width=512):
 
         # Check image shape
         if len(frame.shape) != 3 or frame.shape[2] != 3:
-            logger.error(
-                "Frame %s has unexpected shape %s, expected (H, W, 3)",
-                frame_path,
-                frame.shape,
-            )
-            raise ValueError(
-                f"Frame {frame_path} has unexpected shape {frame.shape}, expected (H, W, 3)"
-            )
+            logger.error("Frame %s has unexpected shape %s, expected (H, W, 3)", frame_path, frame.shape)
+            raise ValueError(f"Frame {frame_path} has unexpected shape {frame.shape}, expected (H, W, 3)")
 
         logger.debug("Loaded frame %s with shape %s", frame_path, frame.shape)
 
@@ -96,21 +89,12 @@ def load_image_frames(track_id, frame_indices, mode, height=288, width=512):
     # Concatenate frames along channel axis
     try:
         concatenated = tf.concat(frames, axis=2)
-        logger.debug(
-            "Concatenated frames shape %s for track_id %s, indices %s",
-            concatenated.shape,
-            track_id,
-            frame_indices,
-        )
+        logger.debug("Concatenated frames shape %s for track_id %s, indices %s", concatenated.shape, track_id, frame_indices)
         return concatenated
     except Exception as e:
-        logger.error(
-            "Failed to concatenate frames for track_id %s, indices %s: %s",
-            track_id,
-            frame_indices,
-            str(e),
-        )
+        logger.error("Failed to concatenate frames for track_id %s, indices %s: %s", track_id, frame_indices, str(e))
         raise ValueError(f"Failed to concatenate frames: {e}")
+
 
 
 def get_video_and_csv_pairs(mode, seq):
@@ -186,7 +170,6 @@ def get_video_and_csv_pairs(mode, seq):
             pairs.append((track_id, csv_path, frame_indices))
     logger.debug("Found %d valid pairs for mode %s", len(pairs), mode)
     return pairs
-
 
 def load_data(track_id, csv_path, frame_indices, mode, seq):
     """
@@ -269,7 +252,6 @@ def load_data(track_id, csv_path, frame_indices, mode, seq):
     )
     return frames, heatmaps
 
-
 def reshape_tensors(frames, heatmaps, seq):
     """
     Reshape tensors to (channels, height, width) for channels_first.
@@ -283,7 +265,6 @@ def reshape_tensors(frames, heatmaps, seq):
         "Reshaped tensors: frames %s, heatmaps %s", frames.shape, heatmaps.shape
     )
     return frames, heatmaps
-
 
 def augment_sequence(frames, heatmaps, seq=3):
     """
@@ -320,9 +301,10 @@ def augment_sequence(frames, heatmaps, seq=3):
         combined = tf.image.random_flip_left_right(combined, seed=None)
         logger.debug("After flip: combined shape %s", combined.shape)
 
-        # # Apply random brightness adjustment
-        # combined = tf.image.random_brightness(combined, max_delta=0.1)
-        # logger.debug("After brightness: combined shape %s", combined.shape)
+        # Apply random rotation up to 7 degrees
+        angle = tf.random.uniform([], minval=-20, maxval=20, dtype=tf.float32) * (3.14159 / 180)
+        combined = tf.image.rot90(combined, k=tf.cast(tf.round(angle / (3.14159 / 2)), tf.int32))
+        logger.debug("After rotation: combined shape %s", combined.shape)
 
         # Split back to frames and heatmaps
         frames = combined[:, :, :9]  # (288, 512, 9)
@@ -348,7 +330,6 @@ def augment_sequence(frames, heatmaps, seq=3):
             "Heatmaps shape: %s", heatmaps.shape if heatmaps is not None else "None"
         )
         raise
-
 
 def main():
     logger = logging.getLogger(__name__)
@@ -388,7 +369,7 @@ def main():
         raise ValueError(f"Invalid sequence length: {args.seq}")
 
     # Validate model name
-    if args.model_name not in ["VballNetFastV1", "VballNetV1"]:
+    if args.model_name not in ["VballNetFastV1", "VballNetV1", "PlayerNetFastV1"]:
         logger.error(
             "Invalid model name: %s. Must be 'VballNetFastV1' or 'VballNetV1'",
             args.model_name,
@@ -503,15 +484,35 @@ def main():
                 model_save_dir,
             )
 
-    # Compile model
-    model.compile(optimizer="adam", loss=custom_loss, metrics=["mae"])
+    # Define learning rate schedule
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1e-3,
+        decay_steps=train_size * 2,  # Decay every two epochs
+        decay_rate=0.9
+    )
+
+    # Compile model with learning rate schedule
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    model.compile(optimizer=optimizer, loss=custom_loss, metrics=["mae"])
     logger.info(
-        "Model compiled with optimizer='adam', loss=custom_loss, metrics=['mae']"
+        "Model compiled with optimizer=Adam(lr_schedule), loss=custom_loss, metrics=['mae']"
     )
 
     filepath = os.path.join(
         model_save_dir, f"{args.model_name}/{args.model_name}_{{epoch:02d}}.keras"
     )
+
+    # Callback for logging learning rate
+    class LearningRateLogger(tf.keras.callbacks.Callback):
+        def __init__(self, lr_schedule, train_size):
+            super().__init__()
+            self.lr_schedule = lr_schedule
+            self.train_size = train_size
+
+        def on_epoch_begin(self, epoch, logs=None):
+            current_step = epoch * self.train_size
+            current_lr = self.lr_schedule(current_step).numpy()
+            logger.info(f"Epoch {epoch + 1}: Learning rate = {current_lr}")
 
     # Callbacks
     callbacks = [
@@ -527,11 +528,13 @@ def main():
             tol=10,  # Set your desired tolerance
             log_dir=os.path.join(MODEL_DIR, "logs", f"{args.model_name}/outcome"),
         ),
+        LearningRateLogger(lr_schedule, train_size)
     ]
 
     logger.info(
-        "Callbacks configured: ModelCheckpoint, TensorBoard, EarlyStopping, OutcomeMetricsCallback"
+        "Callbacks configured: ModelCheckpoint, TensorBoard, EarlyStopping, OutcomeMetricsCallback, LearningRateLogger"
     )
+
     # Log shapes for debugging
     for frames, heatmaps in train_dataset.take(1):
         logger.info(
@@ -561,7 +564,6 @@ def main():
         callbacks=callbacks,
     )
     logger.info("Training completed")
-
 
 if __name__ == "__main__":
     main()

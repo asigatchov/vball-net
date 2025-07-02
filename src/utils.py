@@ -8,7 +8,7 @@ import cv2
 import tensorflow.keras.backend as K
 import tensorflow as tf
 import logging
-
+import os
 from constants import CUSTOMER_DATASET_ROOT, WIDTH, HEIGHT
 from model.VballNetV1 import VballNetV1
 import tensorflow as tf
@@ -97,6 +97,18 @@ def outcome(y_pred, y_true, tol):
                 (cnts, _) = cv2.findContours(h_pred.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 rects = [cv2.boundingRect(ctr) for ctr in cnts]
                 max_area_idx = 0
+
+                if not rects:
+                    debug_dir = "./debug"
+                    if os.path.exists(debug_dir) is False:
+                        os.makedirs(debug_dir)
+
+                    logging.warning("No contours found in predicted heatmap for batch %d, channel %d", i, j)
+                    cv2.imwrite(f"{debug_dir}/debug_pred_{i}_{j}.png", h_pred)
+                    cv2.imwrite(f"{debug_dir}/debug_true_{i}_{j}.png", h_true)
+                    FP1 += 1
+                    continue
+
                 max_area = rects[max_area_idx][2] * rects[max_area_idx][3]
                 for j in range(len(rects)):
                     area = rects[j][2] * rects[j][3]
