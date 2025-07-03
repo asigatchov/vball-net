@@ -1,5 +1,3 @@
-from model.VballNetV1 import VballNetV1
-from constants import HEIGHT, WIDTH
 import tensorflow as tf
 import tensorflow.keras.backend as K
 import pandas as pd
@@ -7,308 +5,785 @@ import numpy as np
 import cv2
 import os
 import argparse
+import logging
 from datetime import datetime
-import glob``
+import glob
+from constants import HEIGHT, WIDTH, SIGMA
+from utils import create_heatmap, custom_loss, OutcomeMetricsCallback
+
+
+# Import get_model function
+def get_model(model_name, height, width, seq, grayscale=False):
+    """
+    Retrieve an instance of a TrackNet model based on the specified model name.
+    """
+    from model.VballNetFastV1 import VballNetFastV1
+    from model.VballNetV1 import VballNetV1
+
+    if model_name == "PlayerNetFastV1":
+        from model.PlayerNetFastV1 import PlayerNetFastV1
+
+        return PlayerNetFastV1(input_shape=(9, height, width), output_channels=3)
+
+    if model_name == "VballNetFastV1":
+        in_dim = seq if grayscale else 9
+        out_dim = seq if grayscale else 3
+        return VballNetFastV1(height, width, in_dim=in_dim, out_dim=out_dim)
+    return VballNetV1(height, width, in_dim=9, out_dim=3)
+
 
 # Parameters
 IMG_HEIGHT = HEIGHT  # 288
-IMG_WIDTH = WIDTH   # 512
-NUM_FRAMES = 3
-BATCH_SIZE = 4  # Increased for better training efficiency
-DATASET_DIR = '/home/gled/frames'  # Base directory for frames
-SIGMA = 5  # Radius for circular heatmap
+IMG_WIDTH = WIDTH  # 512
+IMG_FORMAT = ".png"
+BATCH_SIZE = 10  # Reduced for stability
+DATASET_DIR = "./data/frames"  # Base directory for frames
 MAG = 1.0  # Magnitude for heatmap
 RATIO = 1.0  # Scaling factor for coordinates
-MODEL_DIR = '/home/projects/www/vb-soft/vball-net/models'  # Directory for model saving
+MODEL_DIR = "models"  # Directory for model saving
 
-def custom_loss(y_true, y_pred):
+
+# Configure logging
+def setup_logging(debug=False):
     """
-    Custom loss function for TrackNet training.
+    Configure logging with specified level based on debug flag.
     """
-    loss = (-1) * (
-        K.square(1 - y_pred) * y_true * K.log(K.clip(y_pred, K.epsilon(), 1)) +
-        K.square(y_pred) * (1 - y_true) * K.log(K.clip(1 - y_pred, K.epsilon(), 1))
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    return K.mean(loss)
+    logger = logging.getLogger(__name__)
+    return logger
 
-def display_heatmap(heatmap):
+
+def load_image_frames(
+    track_id, frame_indices, mode, height=288, width=512, grayscale=False
+):
     """
-    Displays the heatmap using OpenCV with a color map.
+    Loads seq preprocessed image frames from DATASET_DIR/mode/track_id/.
     """
-    heatmap_np = heatmap.numpy().squeeze()
-    heatmap_norm = cv2.normalize(heatmap_np, None, 0, 255, cv2.NORM_MINMAX)
-    heatmap_uint8 = heatmap_norm.astype(np.uint8)
-    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-    cv2.imshow('Heatmap', heatmap_color)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-def create_heatmap(x, y, visibility, height=288, width=512, r=5, mag=1.0):
-    """
-    Creates a heatmap tensor with a circular region of specified magnitude.
-    """
-    visibility = tf.cast(visibility, tf.int32)
-    if visibility == 0 or x <= 0 or y <= 0:
-        return tf.zeros((height, width, 1), dtype=tf.float32)
-
-    x = tf.cast((x+1.0), tf.float32)
-    y = tf.cast((y+1.0), tf.float32)
-
-    if x >= width or y >= height:
-        tf.print("Warning: Coordinates out of bounds after offset (x, y):", x, y)
-        return tf.zeros((height, width, 1), dtype=tf.float32)
-
-    x_grid, y_grid = tf.meshgrid(tf.range(width, dtype=tf.float32),
-                                 tf.range(height, dtype=tf.float32))
-
-    heatmap = (y_grid - y)**2 + (x_grid - x)**2
-    heatmap = tf.where(heatmap <= r**2, mag, 0.0)
-    heatmap = tf.expand_dims(heatmap, axis=-1)
-    if heatmap.shape != (height, width, 1):
-        return tf.zeros((height, width, 1), dtype=tf.float32)
-
-    tf.debugging.assert_shapes([(heatmap, (height, width, 1))])
-    return heatmap
-
-
-def load_image_frames(track_id, frame_indices, mode, height=288, width=512):
-    """
-    Loads three preprocessed image frames from DATASET_DIR/mode/track_id/.
-    """
+    logger = logging.getLogger(__name__)
     frames = []
-    track_dir = os.path.join(DATASET_DIR, mode, track_id)
+    track_dir = os.path.join(DATASET_DIR, mode, str(track_id))
     for idx in frame_indices:
-        frame_path = os.path.join(track_dir, f"{idx}.jpg")
+        frame_path = os.path.join(track_dir, f"{idx}{IMG_FORMAT}")
         if not os.path.exists(frame_path):
+            logger.error("Frame not found at %s", frame_path)
             raise FileNotFoundError(f"Frame not found: {frame_path}")
 
-        # Load image
-        frame = cv2.imread(frame_path)
-        if frame is None:
-           # import pdb; pdb.set_trace()
-            raise ValueError(f"Failed to load frame: {frame_path}")
+        # Load image using TensorFlow
+        try:
+            image_string = tf.io.read_file(frame_path)
+            frame = tf.image.decode_jpeg(image_string, channels=1 if grayscale else 3)
+        except Exception as e:
+            logger.error("Failed to load or decode frame %s: %s", frame_path, str(e))
+            raise ValueError(f"Failed to load frame {frame_path}: {e}")
 
         # Check image shape
-        if len(frame.shape) != 3 or frame.shape[2] != 3:
-            raise ValueError(f"Frame {frame_path} has unexpected shape {frame.shape}, expected (H, W, 3)")
+        expected_channels = 1 if grayscale else 3
+        if len(frame.shape) != 3 or frame.shape[2] != expected_channels:
+            logger.error(
+                "Frame %s has unexpected shape %s, expected (H, W, %d)",
+                frame_path,
+                frame.shape,
+                expected_channels,
+            )
+            raise ValueError(
+                f"Frame {frame_path} has unexpected shape {frame.shape}, expected (H, W, {expected_channels})"
+            )
 
-        # Convert to RGB
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        logger.debug("Loaded frame %s with shape %s", frame_path, frame.shape)
 
-        # Convert to TensorFlow tensor
-        frame = tf.convert_to_tensor(frame, dtype=tf.float32)
+        # Convert to float32
+        frame = tf.cast(frame, tf.float32)
 
-        # Resize to target dimensions
-        # try:
-        #     frame = tf.image.resize(frame, [height, width], method='bilinear')
-        # except Exception as e:
-        #     raise ValueError(f"Error resizing frame {frame_path}: {e}")
         # Normalize to [0, 1]
         frame = frame / 255.0
-
         frames.append(frame)
 
-    # Concatenate frames along the channel axis
-    return tf.concat(frames, axis=2)
-def get_video_and_csv_pairs(mode):
+    # Concatenate frames along channel axis
+    try:
+        concatenated = tf.concat(frames, axis=2)
+        logger.debug(
+            "Concatenated frames shape %s for track_id %s, indices %s",
+            concatenated.shape,
+            track_id,
+            frame_indices,
+        )
+        return concatenated
+    except Exception as e:
+        logger.error(
+            "Failed to concatenate frames for track_id %s, indices %s: %s",
+            track_id,
+            frame_indices,
+            str(e),
+        )
+        raise ValueError(f"Failed to concatenate frames: {e}")
+
+
+def get_video_and_csv_pairs(mode, seq):
     """
     Returns a list of (track_id, csv_path, frame_indices) tuples for videos in DATASET_DIR/mode.
     """
+    logger = logging.getLogger(__name__)
     pairs = []
     mode_dir = os.path.join(DATASET_DIR, mode)
     if not os.path.exists(mode_dir):
-        print(f"Warning: Directory {mode_dir} does not exist.")
+        logger.warning("Directory %s does not exist", mode_dir)
         return pairs
 
-    video_dirs = [d for d in os.listdir(mode_dir) if os.path.isdir(os.path.join(mode_dir, d))]
-    #import pdb; pdb.set_trace()
+    video_dirs = [
+        d for d in os.listdir(mode_dir) if os.path.isdir(os.path.join(mode_dir, d))
+    ]
     for track_id in video_dirs:
         csv_path = os.path.join(mode_dir, f"{track_id}_ball.csv")
         if not os.path.exists(csv_path):
-            print(f"Warning: CSV not found for {track_id} at {csv_path}, skipping.")
+            logger.warning(
+                "CSV not found for track_id %s at %s, skipping", track_id, csv_path
+            )
             continue
-        df = pd.read_csv(csv_path, dtype={'X': np.int64, 'Y': np.int64, 'Visibility': np.int64})
-        df = df.fillna({'X': 0, 'Y': 0, 'Visibility': 0})
+        df = pd.read_csv(
+            csv_path,
+            dtype={
+                "Frame": np.int64,
+                "X": np.int64,
+                "Y": np.int64,
+                "Visibility": np.int64,
+            },
+        )
+        df = df.fillna({"X": 0, "Y": 0, "Visibility": 0})
+
+        # Validate Frame column
+        if not np.all(df["Frame"].values == np.arange(len(df))):
+            logger.warning("Non-sequential frame indices in %s, skipping", csv_path)
+            continue
+
         num_frames = len(df)
-        if num_frames < NUM_FRAMES:
-            print(f"Warning: {csv_path} has {num_frames} frames, need at least {NUM_FRAMES}, skipping.")
+        if num_frames < seq:
+            logger.warning(
+                "%s has %d frames, need at least %d, skipping",
+                csv_path,
+                num_frames,
+                seq,
+            )
             continue
-        for t in range(2, num_frames - 3):
-            frame_indices = [t-2, t-1, t]
-            # Verify all frames exist
+        for t in range(seq - 1, num_frames):
+            frame_indices = list(range(t - seq + 1, t + 1))
+            if max(frame_indices) >= len(df):
+                logger.warning(
+                    "Frame indices %s exceed CSV length %d for %s, skipping",
+                    frame_indices,
+                    len(df),
+                    csv_path,
+                )
+                continue
             track_dir = os.path.join(mode_dir, track_id)
-            if all(os.path.exists(os.path.join(track_dir, f"{idx}.jpg")) for idx in frame_indices):
-                pairs.append((track_id, csv_path, frame_indices))
-            else:
-                print(f"Warning: Missing frames for {track_id} at indices {frame_indices}, skipping.")
+            missing = [
+                idx
+                for idx in frame_indices
+                if not os.path.exists(os.path.join(track_dir, f"{idx}{IMG_FORMAT}"))
+            ]
+            if missing:
+                logger.warning(
+                    "Missing frames %s for track_id %s, skipping sequence %s",
+                    missing,
+                    track_id,
+                    frame_indices,
+                )
+                continue
+            pairs.append((track_id, csv_path, frame_indices))
+    logger.debug("Found %d valid pairs for mode %s", len(pairs), mode)
     return pairs
 
-def load_data(track_id, csv_path, frame_indices, mode):
+
+def load_data(track_id, csv_path, frame_indices, mode, seq, grayscale=False):
     """
-    Loads frames and heatmaps for a single sequence.
+    Loads seq frames and their heatmaps for a single sequence.
     """
+    logger = logging.getLogger(__name__)
     if isinstance(track_id, tf.Tensor):
-        track_id = track_id.numpy().decode('utf-8') if track_id.dtype == tf.string else str(track_id.numpy())
+        track_id = (
+            track_id.numpy().decode("utf-8")
+            if track_id.dtype == tf.string
+            else str(track_id.numpy())
+        )
     if isinstance(csv_path, tf.Tensor):
-        csv_path = csv_path.numpy().decode('utf-8') if csv_path.dtype == tf.string else str(csv_path.numpy())
+        csv_path = (
+            csv_path.numpy().decode("utf-8")
+            if csv_path.dtype == tf.string
+            else str(csv_path.numpy())
+        )
     if isinstance(frame_indices, tf.Tensor):
         frame_indices = frame_indices.numpy().tolist()
 
-    frames = load_image_frames(track_id, frame_indices, mode, IMG_HEIGHT, IMG_WIDTH)
+    frames = load_image_frames(
+        track_id, frame_indices, mode, IMG_HEIGHT, IMG_WIDTH, grayscale
+    )
 
-    df = pd.read_csv(csv_path, dtype={'X': np.int64, 'Y': np.int64, 'Visibility': np.int64})
-    df = df.fillna({'X': 0, 'Y': 0, 'Visibility': 0})
+    df = pd.read_csv(
+        csv_path,
+        dtype={"Frame": np.int64, "X": np.int64, "Y": np.int64, "Visibility": np.int64},
+    )
+    df = df.fillna({"X": 0, "Y": 0, "Visibility": 0})
     heatmaps = []
     for idx in frame_indices:
         if idx >= len(df):
+            logger.error("Frame index %d out of range for CSV %s", idx, csv_path)
             raise IndexError(f"Frame index {idx} out of range for CSV {csv_path}")
-        row = df.iloc[idx]
-        x, y, visibility = row['X'], row['Y'], row['Visibility']
-        if not isinstance(visibility, (int, np.int64)) or visibility not in [0, 1]:
-            print(f"Warning: Invalid visibility {visibility} in {csv_path} at index {idx}, setting to 0")
-            visibility = 0
-        x = x / RATIO
-        y = y / RATIO
-        heatmap = create_heatmap(x, y, visibility, IMG_HEIGHT, IMG_WIDTH, SIGMA, MAG)
+        row = df[df["Frame"] == idx]
+        if row.empty:
+            logger.warning(
+                "No data for frame %d in %s, setting heatmap to zero", idx, csv_path
+            )
+            heatmap = tf.zeros((IMG_HEIGHT, IMG_WIDTH, 1), dtype=tf.float32)
+        else:
+            x, y, visibility = (
+                row["X"].iloc[0],
+                row["Y"].iloc[0],
+                row["Visibility"].iloc[0],
+            )
+            if not isinstance(visibility, (int, np.int64)) or visibility not in [0, 1]:
+                logger.warning(
+                    "Invalid visibility %s at frame %d in %s, setting to 0",
+                    visibility,
+                    idx,
+                    csv_path,
+                )
+                visibility = 0
+            x = x / RATIO
+            y = y / RATIO
+            if x < 0 or y < 0 or x >= IMG_WIDTH or y >= IMG_HEIGHT:
+                if x >= IMG_WIDTH or y >= IMG_HEIGHT:
+                    logger.warning(
+                        "Coordinates out of bounds (x=%s, y=%s) at frame %d in %s, setting heatmap to zero",
+                        x,
+                        y,
+                        idx,
+                        csv_path,
+                    )
+                heatmap = tf.zeros((IMG_HEIGHT, IMG_WIDTH, 1), dtype=tf.float32)
+            else:
+                heatmap = create_heatmap(
+                    x, y, visibility, IMG_HEIGHT, IMG_WIDTH, SIGMA, MAG
+                )
         heatmaps.append(heatmap)
 
     heatmaps = tf.concat(heatmaps, axis=2)
-    frames.set_shape([IMG_HEIGHT, IMG_WIDTH, 9])
-    heatmaps.set_shape([IMG_HEIGHT, IMG_WIDTH, 3])
+    frames.set_shape([IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)])
+    heatmaps.set_shape([IMG_HEIGHT, IMG_WIDTH, seq])
+    logger.debug(
+        "Loaded data for track_id %s: frames shape %s, heatmaps shape %s",
+        track_id,
+        frames.shape,
+        heatmaps.shape,
+    )
     return frames, heatmaps
 
-# Create train and test datasets
-train_pairs = get_video_and_csv_pairs('train')
-test_pairs = get_video_and_csv_pairs('test')
 
-print(f"Number of training pairs: {len(train_pairs)}")
-print(f"Number of test pairs: {len(test_pairs)}")
-if len(train_pairs) == 0:
-    raise ValueError("No training data found. Check DATASET_DIR/train and frame/CSV files.")
-if len(test_pairs) == 0:
-    print("Warning: No test data found. Check DATASET_DIR/test and frame/CSV files.")
-
-train_dataset = tf.data.Dataset.from_tensor_slices((
-    [p[0] for p in train_pairs],
-    [p[1] for p in train_pairs],
-    [p[2] for p in train_pairs]
-)).map(
-    lambda t, c, f: tf.py_function(
-        func=lambda x, y, z: load_data(x, y, z, 'train'),
-        inp=[t, c, f],
-        Tout=[tf.float32, tf.float32]
-    ),
-    num_parallel_calls=tf.data.AUTOTUNE
-)
-
-test_dataset = tf.data.Dataset.from_tensor_slices((
-    [p[0] for p in test_pairs],
-    [p[1] for p in test_pairs],
-    [p[2] for p in test_pairs]
-)).map(
-    lambda t, c, f: tf.py_function(
-        func=lambda x, y, z: load_data(x, y, z, 'test'),
-        inp=[t, c, f],
-        Tout=[tf.float32, tf.float32]
-    ),
-    num_parallel_calls=tf.data.AUTOTUNE
-)
-
-def reshape_tensors(frames, heatmaps):
+def reshape_tensors(frames, heatmaps, seq, grayscale=False):
     """
-    Reshape tensors to (channels, height, width) if needed by the model.
+    Reshape tensors to (channels, height, width) for channels_first.
     """
-    frames = tf.ensure_shape(frames, [IMG_HEIGHT, IMG_WIDTH, 9])
-    heatmaps = tf.ensure_shape(heatmaps, [IMG_HEIGHT, IMG_WIDTH, 3])
-    # Transpose only if model expects (channels, height, width)
-    frames = tf.transpose(frames, [2, 0, 1])  # (9, 288, 512)
-    heatmaps = tf.transpose(heatmaps, [2, 0, 1])  # (3, 288, 512)
+    logger = logging.getLogger(__name__)
+    frames = tf.ensure_shape(
+        frames, [IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)]
+    )
+    heatmaps = tf.ensure_shape(heatmaps, [IMG_HEIGHT, IMG_WIDTH, seq])
+    frames = tf.transpose(frames, [2, 0, 1])  # (seq*(1 or 3), 288, 512)
+    heatmaps = tf.transpose(heatmaps, [2, 0, 1])  # (seq, 288, 512)
+    logger.debug(
+        "Reshaped tensors: frames %s, heatmaps %s", frames.shape, heatmaps.shape
+    )
     return frames, heatmaps
 
-train_dataset = train_dataset.map(reshape_tensors, num_parallel_calls=tf.data.AUTOTUNE)
-test_dataset = test_dataset.map(reshape_tensors, num_parallel_calls=tf.data.AUTOTUNE)
 
-def augment_sequence(frames, heatmaps):
+def augment_sequence(frames, heatmaps, seq, grayscale=False):
     """
-    Apply data augmentation to frames and heatmaps.
+    Apply data augmentation to frames and heatmaps using TensorFlow.
     """
-    frames = tf.transpose(frames, [1, 2, 0])  # (288, 512, 9)
-    heatmaps = tf.transpose(heatmaps, [1, 2, 0])  # (288, 512, 3)
-    combined = tf.concat([frames, heatmaps], axis=2)
-    combined = tf.image.random_flip_left_right(combined)
-    #combined = tf.image.random_flip_up_down(combined)
-    combined = tf.image.random_brightness(combined, max_delta=0.1)
-    frames = combined[:, :, :9]
-    heatmaps = combined[:, :, 9:]
-    frames = tf.transpose(frames, [2, 0, 1])
-    heatmaps = tf.transpose(heatmaps, [2, 0, 1])
-    return frames, heatmaps
+    logger = logging.getLogger(__name__)
+    try:
+        # Validate input shapes
+        tf.debugging.assert_shapes(
+            [
+                (frames, (seq * (1 if grayscale else 3), 288, 512)),
+                (heatmaps, (seq, 288, 512)),
+            ]
+        )
+        # Check for valid pixel values
+        tf.debugging.assert_non_negative(
+            frames, message="Frames contain negative values"
+        )
+        tf.debugging.assert_less_equal(frames, 1.0, message="Frames contain values > 1")
+        tf.debugging.assert_non_negative(
+            heatmaps, message="Heatmaps contain negative values"
+        )
+        tf.debugging.assert_less_equal(
+            heatmaps, 1.0, message="Heatmaps contain values > 1"
+        )
 
-#train_dataset = train_dataset.map(augment_sequence, num_parallel_calls=tf.data.AUTOTUNE)
-train_dataset = train_dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-test_dataset = test_dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+        logger.debug(
+            "Input shapes: frames %s, heatmaps %s", frames.shape, heatmaps.shape
+        )
 
-# Debugging info
-train_size = tf.data.experimental.cardinality(train_dataset).numpy()
-test_size = tf.data.experimental.cardinality(test_dataset).numpy()
-print(f"Number of training batches: {train_size}")
-print(f"Number of test batches: {test_size}")
+        # Transpose to (height, width, channels)
+        frames = tf.transpose(frames, [1, 2, 0])  # (288, 512, seq*(1 or 3))
+        heatmaps = tf.transpose(heatmaps, [1, 2, 0])  # (288, 512, seq)
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description='Train VballNetV1 model.')
-parser.add_argument('--resume', action='store_true', help='Resume training from the latest checkpoint.')
-args = parser.parse_args()
+        # Concatenate along channel axis
+        combined = tf.concat([frames, heatmaps], axis=2)  # (288, 512, seq*(1 or 3)+seq)
 
-# Create timestamped directory for saving models
-timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-model_save_dir = os.path.join(MODEL_DIR, timestamp)
-os.makedirs(model_save_dir, exist_ok=True)
+        # Apply left-right flip with 50% probability
+        combined = tf.image.random_flip_left_right(combined, seed=None)
+        logger.debug("After flip: combined shape %s", combined.shape)
 
-# Initialize model
-model = VballNetV1(input_height=IMG_HEIGHT, input_width=IMG_WIDTH)
+        # Apply random rotation up to 7 degrees
+        angle = tf.random.uniform([], minval=-20, maxval=20, dtype=tf.float32) * (
+            3.14159 / 180
+        )
+        combined = tf.image.rot90(
+            combined, k=tf.cast(tf.round(angle / (3.14159 / 2)), tf.int32)
+        )
+        logger.debug("After rotation: combined shape %s", combined.shape)
 
-# Load latest checkpoint if resuming
-initial_epoch = 0
-if args.resume:
-    checkpoint_files = glob.glob(os.path.join(MODEL_DIR, '*', 'vballNetV1_*.keras'))
-    if checkpoint_files:
-        latest_checkpoint = max(checkpoint_files, key=os.path.getmtime)
-        print(f"Resuming training from {latest_checkpoint}")
-        model = tf.keras.models.load_model(latest_checkpoint, custom_objects={'custom_loss': custom_loss})
-        epoch_str = latest_checkpoint.split('_')[-1].replace('.keras', '')
-        initial_epoch = int(epoch_str) if epoch_str.isdigit() else 0
-    else:
-        print("No checkpoints found, starting training from scratch.")
+        # Split back to frames and heatmaps
+        frames = combined[
+            :, :, : seq * (1 if grayscale else 3)
+        ]  # (288, 512, seq*(1 or 3))
+        heatmaps = combined[:, :, seq * (1 if grayscale else 3) :]  # (288, 512, seq)
 
-# Compile model
-model.compile(
-    optimizer='adam',
-    loss=custom_loss,
-    metrics=['mae']
-)
+        # Transpose back to (channels, height, width)
+        frames = tf.transpose(frames, [2, 0, 1])  # (seq*(1 or 3), 288, 512)
+        heatmaps = tf.transpose(heatmaps, [2, 0, 1])  # (seq, 288, 512)
 
-# Callbacks
-callbacks = [
-    tf.keras.callbacks.ModelCheckpoint(
-        os.path.join(model_save_dir, 'vballNetV1_{epoch:02d}.keras'),
-        save_best_only=False,
-        monitor='val_loss'
-    ),
-    tf.keras.callbacks.TensorBoard(log_dir=os.path.join(MODEL_DIR, 'logs', timestamp)),
-    tf.keras.callbacks.EarlyStopping(patience=5, monitor='val_loss')
-]
+        # Ensure output shapes
+        frames = tf.ensure_shape(frames, [seq * (1 if grayscale else 3), 288, 512])
+        heatmaps = tf.ensure_shape(heatmaps, [seq, 288, 512])
+        logger.debug(
+            "Final shapes: frames %s, heatmaps %s", frames.shape, heatmaps.shape
+        )
 
-# Print shapes for debugging
-for frames, heatmaps in train_dataset.take(1):
-    print("Frames shape:", frames.shape)  # Expected: (batch_size, 9, 288, 512)
-    print("Heatmaps shape:", heatmaps.shape)  # Expected: (batch_size, 3, 288, 512)
+        return frames, heatmaps
 
-# Train model
-print("Starting training...")
-model.fit(
-    train_dataset,
-    validation_data=test_dataset,
-    epochs=50,
-    initial_epoch=initial_epoch,
-    callbacks=callbacks
-)
+    except Exception as e:
+        logger.error("Error in augment_sequence: %s", str(e))
+        logger.error("Frames shape: %s", frames.shape if frames is not None else "None")
+        logger.error(
+            "Heatmaps shape: %s", heatmaps.shape if heatmaps is not None else "None"
+        )
+        raise
+
+
+def main():
+    logger = logging.getLogger(__name__)
+
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Train VballNet model.")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the latest checkpoint.",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument(
+        "--seq", type=int, default=3, help="Number of frames in sequence."
+    )
+    parser.add_argument(
+        "--grayscale",
+        action="store_true",
+        help="Use grayscale frames with seq input/output channels.",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="VballNetFastV1",
+        help="Model name to train (VballNetFastV1 or VballNetV1).",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=50,
+        help="Number of epochs to train (default: 50).",
+    )
+    args = parser.parse_args()
+
+    # Setup logging
+    setup_logging(args.debug)
+    logger.info(
+        "Starting training script with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s",
+        args.seq,
+        args.grayscale,
+        args.debug,
+        args.resume,
+        args.model_name,
+    )
+
+    # Validate seq
+    if args.seq < 1:
+        logger.error("Sequence length must be at least 1, got %d", args.seq)
+        raise ValueError(f"Invalid sequence length: {args.seq}")
+
+    # Validate model name
+    if args.model_name not in ["VballNetFastV1", "VballNetV1", "PlayerNetFastV1"]:
+        logger.error(
+            "Invalid model name: %s. Must be 'VballNetFastV1' or 'VballNetV1'",
+            args.model_name,
+        )
+        raise ValueError(f"Invalid model name: {args.model_name}")
+
+    # Set model save directory based on grayscale and seq
+    model_name_suffix = (
+        f"_seq{args.seq}_grayscale" if args.grayscale and args.seq == 9 else ""
+    )
+    model_save_name = f"{args.model_name}{model_name_suffix}"
+    model_save_dir = os.path.join(MODEL_DIR, model_save_name)
+    os.makedirs(model_save_dir, exist_ok=True)
+    logger.info("Created model save directory: %s", model_save_dir)
+
+    # Create train and test datasets
+    train_pairs = get_video_and_csv_pairs("train", args.seq)
+    test_pairs = get_video_and_csv_pairs("test", args.seq)
+
+    logger.info("Number of training pairs: %d", len(train_pairs))
+    logger.info("Number of test pairs: %d", len(test_pairs))
+    if len(train_pairs) == 0:
+        logger.error(
+            "No training data found. Check DATASET_DIR/train and frame/CSV files."
+        )
+        raise ValueError(
+            "No training data found. Check DATASET_DIR/train and frame/CSV files."
+        )
+    if len(test_pairs) == 0:
+        logger.warning(
+            "No test data found. Check DATASET_DIR/test and frame/CSV files."
+        )
+
+    train_dataset = (
+        tf.data.Dataset.from_tensor_slices(
+            (
+                [p[0] for p in train_pairs],
+                [p[1] for p in train_pairs],
+                [p[2] for p in train_pairs],
+            )
+        )
+        .map(
+            lambda t, c, f: tf.py_function(
+                func=lambda x, y, z: load_data(
+                    x, y, z, "train", args.seq, args.grayscale
+                ),
+                inp=[t, c, f],
+                Tout=[tf.float32, tf.float32],
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+        .map(
+            lambda frames, heatmaps: reshape_tensors(
+                frames, heatmaps, args.seq, args.grayscale
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+        .map(
+            lambda frames, heatmaps: augment_sequence(
+                frames, heatmaps, args.seq, args.grayscale
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+        .batch(BATCH_SIZE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    test_dataset = (
+        tf.data.Dataset.from_tensor_slices(
+            (
+                [p[0] for p in test_pairs],
+                [p[1] for p in test_pairs],
+                [p[2] for p in test_pairs],
+            )
+        )
+        .map(
+            lambda t, c, f: tf.py_function(
+                func=lambda x, y, z: load_data(
+                    x, y, z, "test", args.seq, args.grayscale
+                ),
+                inp=[t, c, f],
+                Tout=[tf.float32, tf.float32],
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+        .map(
+            lambda frames, heatmaps: reshape_tensors(
+                frames, heatmaps, args.seq, args.grayscale
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+        .batch(BATCH_SIZE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # Log dataset sizes
+    train_size = tf.data.experimental.cardinality(train_dataset).numpy()
+    test_size = tf.data.experimental.cardinality(test_dataset).numpy()
+    logger.info("Number of training batches: %d", train_size)
+    logger.info("Number of test batches: %d", test_size)
+
+    # Initialize model using get_model
+    model = get_model(
+        args.model_name,
+        height=IMG_HEIGHT,
+        width=IMG_WIDTH,
+        seq=args.seq,
+        grayscale=args.grayscale,
+    )
+    model.summary(print_fn=lambda x: logger.info(x))  # Redirect summary to logger
+
+    # Load latest checkpoint if resuming
+    initial_epoch = 0
+    if args.resume:
+        checkpoint_files = glob.glob(
+            os.path.join(model_save_dir, f"{model_save_name}/{model_save_name}_*.keras")
+        )
+        if checkpoint_files:
+            latest_checkpoint = max(checkpoint_files, key=os.path.getmtime)
+            logger.info("Resuming training from %s", latest_checkpoint)
+            model = tf.keras.models.load_model(
+                latest_checkpoint, custom_objects={"custom_loss": custom_loss}
+            )
+            # Extract epoch from checkpoint filename (e.g., VballNetFastV1_seq9_grayscale_01.keras)
+            epoch_str = (
+                os.path.basename(latest_checkpoint).split("_")[-1].replace(".keras", "")
+            )
+            initial_epoch = int(epoch_str) if epoch_str.isdigit() else 0
+        else:
+            logger.warning(
+                "No checkpoints found for %s in %s, starting training from scratch.",
+                model_save_name,
+                model_save_dir,
+            )
+
+    # Define learning rate schedule
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1e-3,
+        decay_steps=train_size * 2,  # Decay every two epochs
+        decay_rate=0.9,
+    )
+
+    # Compile model with learning rate schedule
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    model.compile(optimizer=optimizer, loss=custom_loss, metrics=["mae"])
+    logger.info(
+        "Model compiled with optimizer=Adam(lr_schedule), loss=custom_loss, metrics=['mae']"
+    )
+
+    filepath = os.path.join(
+        model_save_dir, f"{model_save_name}/{model_save_name}_{{epoch:02d}}.keras"
+    )
+
+    # Callback for logging learning rate
+    class LearningRateLogger(tf.keras.callbacks.Callback):
+        def __init__(self, lr_schedule, train_size):
+            super().__init__()
+            self.lr_schedule = lr_schedule
+            self.train_size = train_size
+
+        def on_epoch_begin(self, epoch, logs=None):
+            current_step = epoch * self.train_size
+            current_lr = self.lr_schedule(current_step).numpy()
+            logger.info(f"Epoch {epoch + 1}: Learning rate = {current_lr}")
+
+    class VisualizationCallback(tf.keras.callbacks.Callback):
+        def __init__(
+            self,
+            test_dataset,
+            save_dir="visualizations",
+            seq=4,
+            buffer_size=1,
+            grayscale=False,
+        ):
+            super().__init__()
+            self.test_dataset = test_dataset
+            self.save_dir = save_dir
+            self.seq = seq
+            self.buffer_size = buffer_size
+            self.grayscale = grayscale
+            os.makedirs(self.save_dir, exist_ok=True)
+
+        def on_epoch_end(self, epoch, logs=None):
+            logger = logging.getLogger(__name__)
+            for frames, heatmaps in self.test_dataset.shuffle(self.buffer_size):
+                # frames: (batch_size, channels, height, width), e.g., (1, seq*(1 or 3), 288, 512)
+                # heatmaps: (batch_size, seq, height, width), e.g., (1, seq, 288, 512)
+                pred_heatmaps = self.model.predict(frames, verbose=0)  # (1, seq, 288, 512)
+
+                # Транспонируем frames для получения (batch_size, height, width, channels)
+                frames = tf.transpose(frames, [0, 2, 3, 1])  # (1, 288, 512, seq*(1 or 3))
+
+                # Для первого элемента батча
+                frames_np = frames[0].numpy()  # (288, 512, seq*(1 or 3))
+                heatmaps_np = heatmaps[0].numpy()  # (seq, 288, 512)
+                pred_heatmaps_np = pred_heatmaps[0]  # (seq, 288, 5192)
+
+                # Логируем форму для отладки
+                logger.debug(
+                    "frames_np shape: %s, type: %s", frames_np.shape, type(frames_np)
+                )
+                logger.debug(
+                    "heatmaps_np shape: %s, type: %s", heatmaps_np.shape, type(heatmaps_np)
+                )
+                logger.debug(
+                    "pred_heatmaps_np shape: %s, type: %s",
+                    pred_heatmaps_np.shape,
+                    type(pred_heatmaps_np),
+                )
+
+                # Создаём составное изображение для каждого кадра
+                for i in range(self.seq):
+                    # Извлекаем i-й кадр
+                    if self.grayscale:
+                        frame = frames_np[:, :, i : i + 1]  # (288, 512, 1)
+                        logger.debug("Grayscale frame slice shape: %s", frame.shape)
+                        # Проверяем форму и добавляем канал, если необходимо
+                        if frame.shape[-1] != 1:
+                            logger.error(
+                                "Unexpected frame shape %s, expected last dimension to be 1",
+                                frame.shape,
+                            )
+                            raise ValueError(
+                                f"Unexpected frame shape {frame.shape}, expected last dimension to be 1"
+                            )
+                        # frame is numpy array here, so we can use cv2.cvtColor
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)  # (288, 512, 3)
+                        frame = tf.convert_to_tensor(frame_rgb, dtype=tf.float32)
+                        frame = tf.ensure_shape(frame, [288, 512, 3])
+                    else:
+                        frame = frames_np[:, :, i * 3 : (i + 1) * 3]  # (288, 512, 3)
+                        logger.debug("RGB frame slice shape: %s", frame.shape)
+                        if frame.shape[-1] != 3:
+                            logger.error(
+                                "Unexpected frame shape %s, expected last dimension to be 3",
+                                frame.shape,
+                            )
+                            raise ValueError(
+                                f"Unexpected frame shape {frame.shape}, expected last dimension to be 3"
+                            )
+                        frame = tf.convert_to_tensor(
+                            frame, dtype=tf.float32
+                        )  # Convert to tensor
+                        frame = tf.ensure_shape(
+                            frame, [288, 512, 3]
+                        )  # Ensure correct shape
+
+                    true_heatmap = heatmaps_np[i, :, :]  # (288, 512)
+                    pred_heatmap = pred_heatmaps_np[i, :, :]  # (288, 512)
+                    logger.debug("true_heatmap shape: %s", true_heatmap.shape)
+                    logger.debug("pred_heatmap shape: %s", pred_heatmap.shape)
+
+                    # Нормализуем для сохранения
+                    frame = tf.cast(frame * 255, tf.uint8)
+                    true_heatmap = tf.convert_to_tensor(true_heatmap, dtype=tf.float32)
+                    pred_heatmap = tf.convert_to_tensor(pred_heatmap, dtype=tf.float32)
+                    true_heatmap = tf.cast(true_heatmap * 255, tf.uint8)
+                    pred_heatmap = tf.cast(pred_heatmap * 255, tf.uint8)
+
+                    # Преобразуем тепловые карты в 3 канала для совместимости
+                    true_heatmap = tf.ensure_shape(true_heatmap, [288, 512])
+                    pred_heatmap = tf.ensure_shape(pred_heatmap, [288, 512])
+                    true_heatmap = tf.expand_dims(true_heatmap, axis=-1)  # (288, 512, 1)
+                    pred_heatmap = tf.expand_dims(pred_heatmap, axis=-1)  # (288, 512, 1)
+                    true_heatmap = tf.image.grayscale_to_rgb(true_heatmap)  # (288, 512, 3)
+                    pred_heatmap = tf.image.grayscale_to_rgb(pred_heatmap)  # (288, 512, 3)
+
+                    # Объединяем изображения по горизонтали
+                    combined = tf.concat(
+                        [frame, true_heatmap, pred_heatmap], axis=1
+                    )  # (288, 1536, 3)
+
+                    try:
+                        # Сохраняем
+                        tf.io.write_file(
+                            os.path.join(
+                                self.save_dir, f"vis_epoch_{epoch:03d}_frame_{i}.png"
+                            ),
+                            tf.image.encode_png(combined),
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to save visualization for epoch %d, frame %d: %s",
+                            epoch,
+                            i,
+                            str(e),
+                        )
+                        logger.debug("frames_np shape: %s", frames_np.shape)
+                        logger.debug("true_heatmap shape: %s", true_heatmap.shape)
+                        logger.debug("pred_heatmap shape: %s", pred_heatmap.shape)
+                        continue
+
+    # Callbacks
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=os.path.join(filepath), save_best_only=False, monitor="val_loss"
+        ),
+        tf.keras.callbacks.TensorBoard(
+            log_dir=os.path.join(MODEL_DIR, "logs", model_save_name)
+        ),
+        tf.keras.callbacks.EarlyStopping(patience=30, monitor="val_loss"),
+        # OutcomeMetricsCallback(
+        #     validation_data=test_dataset,
+        #     tol=10,  # Set your desired tolerance
+        #     log_dir=os.path.join(MODEL_DIR, "logs", f"{model_save_name}/outcome"),
+        # ),
+        LearningRateLogger(lr_schedule, train_size),
+        VisualizationCallback(
+            test_dataset=test_dataset,
+            save_dir=os.path.join(MODEL_DIR, "visualizations"),
+            seq=args.seq,
+            grayscale=args.grayscale,
+        ),
+    ]
+
+    logger.info(
+        "Callbacks configured: ModelCheckpoint, TensorBoard, EarlyStopping, OutcomeMetricsCallback, LearningRateLogger, VisualizationCallback"
+    )
+
+    # Log shapes for debugging
+    for frames, heatmaps in train_dataset.take(1):
+        logger.info(
+            "Frames shape: %s", frames.shape
+        )  # Expected: (batch_size, seq*(1 or 3), 288, 512)
+        logger.info(
+            "Heatmaps shape: %s", heatmaps.shape
+        )  # Expected: (batch_size, seq, 288, 512)
+        frames = tf.transpose(frames[0], [1, 2, 0])  # (288, 512, seq*(1 or 3))
+        heatmaps = tf.transpose(heatmaps[0], [1, 2, 0])  # (288, 512, seq)
+        if args.grayscale:
+            tf.io.write_file(
+                "augmented_frame.png",
+                tf.image.encode_png(
+                    tf.cast(tf.image.grayscale_to_rgb(frames[:, :, :1]) * 255, tf.uint8)
+                ),
+            )
+        else:
+            tf.io.write_file(
+                "augmented_frame.png",
+                tf.image.encode_png(tf.cast(frames[:, :, :3] * 255, tf.uint8)),
+            )
+        tf.io.write_file(
+            "augmented_heatmap.png",
+            tf.image.encode_png(tf.cast(heatmaps[:, :, 0:1] * 255, tf.uint8)),
+        )
+
+    # Train model
+    logger.info("Starting training...")
+    model.fit(
+        train_dataset,
+        validation_data=test_dataset,
+        epochs=args.epochs,
+        initial_epoch=initial_epoch,
+        callbacks=callbacks,
+    )
+    logger.info("Training completed")
+
+
+if __name__ == "__main__":
+    main()

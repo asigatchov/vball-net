@@ -197,7 +197,7 @@ def main():
                     )  # Create window with freedom of dimensions
 
                     cv2.imshow('Ball Tracking', vis_frame)
-                    if cv2.waitKey(0) & 0xFF == ord('q'):
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
                 if out_writer is not None:
                     out_writer.write(vis_frame)
