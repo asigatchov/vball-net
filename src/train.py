@@ -8,8 +8,13 @@ import argparse
 import logging
 from datetime import datetime
 import glob
-from constants import HEIGHT, WIDTH
+from constants import HEIGHT, WIDTH, SIGMA
 from utils import create_heatmap, custom_loss, OutcomeMetricsCallback
+
+
+import tensorflow as tf
+import numpy as np
+
 
 # Import get_model function
 def get_model(model_name, height, width):
@@ -31,9 +36,8 @@ def get_model(model_name, height, width):
 IMG_HEIGHT = HEIGHT  # 288
 IMG_WIDTH = WIDTH  # 512
 IMG_FORMAT = ".png"
-BATCH_SIZE = 1  # Reduced for stability
-DATASET_DIR = "/home/gled/frames"  # Base directory for frames
-SIGMA = 5  # Radius for circular heatmap
+BATCH_SIZE = 10  # Reduced for stability
+DATASET_DIR = "./data/frames"  # Base directory for frames
 MAG = 1.0  # Magnitude for heatmap
 RATIO = 1.0  # Scaling factor for coordinates
 MODEL_DIR = "models"  # Directory for model saving
@@ -94,7 +98,6 @@ def load_image_frames(track_id, frame_indices, mode, height=288, width=512):
     except Exception as e:
         logger.error("Failed to concatenate frames for track_id %s, indices %s: %s", track_id, frame_indices, str(e))
         raise ValueError(f"Failed to concatenate frames: {e}")
-
 
 
 def get_video_and_csv_pairs(mode, seq):
@@ -351,6 +354,12 @@ def main():
         default="VballNetFastV1",
         help="Model name to train (VballNetFastV1 or VballNetV1).",
     )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=50,
+        help="Number of epochs to train (default: 50)."
+    )
     args = parser.parse_args()
 
     # Setup logging
@@ -514,6 +523,70 @@ def main():
             current_lr = self.lr_schedule(current_step).numpy()
             logger.info(f"Epoch {epoch + 1}: Learning rate = {current_lr}")
 
+    class VisualizationCallback(tf.keras.callbacks.Callback):
+        def __init__(self, test_dataset, save_dir="visualizations", seq=4, buffer_size=1):
+            super(VisualizationCallback, self).__init__()  # Вызываем __init__ базового класса без аргументов
+            self.test_dataset = test_dataset
+            self.save_dir = save_dir
+            self.seq = seq
+            self.buffer_size = buffer_size
+            os.makedirs(self.save_dir, exist_ok=True)
+
+        def on_epoch_end(self, epoch, logs=None):
+            for frames, heatmaps in self.test_dataset.shuffle(self.buffer_size):
+                # frames: (batch_size, channels, height, width), e.g., (1, 12, 288, 512) для seq=4
+                # heatmaps: (batch_size, seq, height, width), e.g., (1, 4, 288, 512)
+                pred_heatmaps = self.model.predict(frames, verbose=0)  # (1, 4, 288, 512)
+
+                # Транспонируем frames для получения (batch_size, height, width, channels)
+                frames = tf.transpose(frames, [0, 2, 3, 1])  # (1, 288, 512, 12)
+
+                # Для первого элемента батча
+                frames_np = frames[0].numpy()  # (288, 512, 12)
+                heatmaps_np = heatmaps[0].numpy()  # (4, 288, 512)
+                pred_heatmaps_np = pred_heatmaps[0]  # (4, 288, 512)
+
+                # Создаём составное изображение для каждого кадра
+                for i in range(self.seq):
+                    # Извлекаем i-й кадр (3 канала RGB)
+                    frame = frames_np[:, :, i*3:(i+1)*3]  # (288, 512, 3)
+                    true_heatmap = heatmaps_np[i, :, :]  # (288, 512)
+                    pred_heatmap = pred_heatmaps_np[i, :, :]  # (288, 512)
+
+                    # Нормализуем для сохранения
+                    frame = tf.cast(frame * 255, tf.uint8)
+                    true_heatmap = tf.cast(true_heatmap * 255, tf.uint8)
+                    pred_heatmap = tf.cast(pred_heatmap * 255, tf.uint8)
+
+                    # Преобразуем тепловые карты в 3 канала для совместимости
+                    true_heatmap = tf.ensure_shape(true_heatmap, [288, 512])
+                    pred_heatmap = tf.ensure_shape(pred_heatmap, [288, 512])
+                    true_heatmap = tf.expand_dims(true_heatmap, axis=-1)  # (288, 512, 1)
+                    pred_heatmap = tf.expand_dims(pred_heatmap, axis=-1)
+                    true_heatmap = tf.image.grayscale_to_rgb(true_heatmap)  # (288, 512, 3)
+                    pred_heatmap = tf.image.grayscale_to_rgb(pred_heatmap)
+
+                    # Объединяем изображения по горизонтали
+                    combined = tf.concat([frame, true_heatmap, pred_heatmap], axis=1)  # (288, 1536, 3)
+
+                    try:
+                        # Сохраняем
+                        tf.io.write_file(
+                            os.path.join(self.save_dir, f"vis_epoch_{epoch:03d}_frame_{i}.png"),
+                            tf.image.encode_png(combined)
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to save visualization for epoch %d, frame %d: %s",
+                            epoch,
+                            i,
+                            str(e),
+                        )
+                        logger.debug("frames_np shape: %s", frames_np.shape)
+                        logger.debug("true_heatmap shape: %s", true_heatmap.shape)
+                        logger.debug("pred_heatmap shape: %s", pred_heatmap.shape)
+                        continue
+
     # Callbacks
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
@@ -528,8 +601,17 @@ def main():
             tol=10,  # Set your desired tolerance
             log_dir=os.path.join(MODEL_DIR, "logs", f"{args.model_name}/outcome"),
         ),
-        LearningRateLogger(lr_schedule, train_size)
+        LearningRateLogger(lr_schedule, train_size),
+
     ]
+
+    callbacks.append(
+        VisualizationCallback(
+            test_dataset=test_dataset,
+            save_dir=os.path.join(MODEL_DIR, "visualizations"),
+            seq=args.seq
+        )
+    )
 
     logger.info(
         "Callbacks configured: ModelCheckpoint, TensorBoard, EarlyStopping, OutcomeMetricsCallback, LearningRateLogger"
@@ -559,11 +641,12 @@ def main():
     model.fit(
         train_dataset,
         validation_data=test_dataset,
-        epochs=155,
+        epochs=args.epochs,
         initial_epoch=initial_epoch,
         callbacks=callbacks,
     )
     logger.info("Training completed")
+
 
 if __name__ == "__main__":
     main()

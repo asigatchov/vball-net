@@ -54,7 +54,6 @@ def get_video_and_csv_pairs(data_dir):
                     pairs.append((video_path, csv_path, track_id))
 
     return pairs
-    return pairs
 
 
 def rescale_coordinates(x, y, orig_width, orig_height, new_width=512, new_height=288):

@@ -6,17 +6,17 @@ import logging
 from PIL import Image
 import matplotlib.pyplot as plt
 from constants import HEIGHT, WIDTH
-from utils import create_heatmap
+from utils import create_heatmap, SIGMA
 from train import load_image_frames, get_video_and_csv_pairs, load_data, reshape_tensors, augment_sequence
 
 # Parameters
 IMG_HEIGHT = HEIGHT  # 288
 IMG_WIDTH = WIDTH  # 512
 DATASET_DIR = "/home/gled/frames"  # Base directory for frames
-SIGMA = 5  # Radius for circular heatmap
+#SIGMA = 5  # Radius for circular heatmap
 MAG = 1.0  # Magnitude for heatmap
 RATIO = 1.0  # Scaling factor for coordinates
-DEBUG_DIR = "debug/combined"  # Directory for saving combined images
+DEBUG_DIR = "debug"  # Directory for saving combined images
 
 # Configure logging
 def setup_logging(debug=False):
@@ -35,32 +35,32 @@ def setup_logging(debug=False):
 def overlay_heatmap(frame, heatmap, alpha=0.4):
     """
     Overlay heatmap on frame using a colormap and transparency.
-    
+
     Args:
         frame: NumPy array of shape (height, width, 3) with RGB values in [0, 1]
         heatmap: NumPy array of shape (height, width, 1) with values in [0, 1]
         alpha: Transparency for heatmap overlay (0.0 to 1.0)
-    
+
     Returns:
         NumPy array of shape (height, width, 3) with overlaid heatmap
     """
     logger = logging.getLogger(__name__)
-    
+
     # Convert heatmap to colormap (using 'jet' for visualization)
     cmap = plt.get_cmap('jet')
     heatmap_normalized = heatmap  # Already in [0, 1]
     heatmap_colored = cmap(heatmap_normalized[:, :, 0])[:, :, :3]  # Get RGB from colormap
-    
+
     # Blend frame and heatmap
     blended = (frame * (1 - alpha) + heatmap_colored * alpha).astype(np.float32)
-    
+
     logger.debug("Overlayed heatmap on frame, resulting shape: %s", blended.shape)
     return blended
 
 def combine_images(frame, heatmap, track_id, frame_indices, debug_dir):
     """
     Combine original frame and frame with overlaid heatmap into a single image.
-    
+
     Args:
         frame: NumPy array of shape (height, width, 3) with RGB values in [0, 1]
         heatmap: NumPy array of shape (height, width, 1) with values in [0, 1]
@@ -69,29 +69,29 @@ def combine_images(frame, heatmap, track_id, frame_indices, debug_dir):
         debug_dir: Directory to save the combined image
     """
     logger = logging.getLogger(__name__)
-    
+
     try:
         # Overlay heatmap on frame
         frame_with_heatmap = overlay_heatmap(frame, heatmap)
-        
+
         # Convert to uint8 for saving
         frame = (frame * 255).astype(np.uint8)
         frame_with_heatmap = (frame_with_heatmap * 255).astype(np.uint8)
-        
+
         # Create combined image (stack vertically)
         combined = np.zeros((IMG_HEIGHT * 2, IMG_WIDTH, 3), dtype=np.uint8)
         combined[:IMG_HEIGHT, :, :] = frame
         combined[IMG_HEIGHT:, :, :] = frame_with_heatmap
-        
+
         # Create filename with track_id and frame indices
         frame_str = "_".join(map(str, frame_indices))
         output_path = os.path.join(debug_dir, f"combined_{track_id}_{frame_str}.png")
-        
+
         # Save combined image
         combined_img = Image.fromarray(combined)
         combined_img.save(output_path, format="PNG")
         logger.info("Saved combined image to %s", output_path)
-        
+
     except Exception as e:
         logger.error("Error combining images for track_id %s, frame_indices %s: %s",
                      track_id, frame_indices, str(e))
@@ -160,22 +160,22 @@ def main():
         try:
             # Load data
             frames, heatmaps = load_data(track_id, csv_path, frame_indices, "train", args.seq)
-            
+
             # Reshape tensors
             frames, heatmaps = reshape_tensors(frames, heatmaps, args.seq)
-            
+
             # Apply augmentation
             aug_frames, aug_heatmaps = augment_sequence(frames, heatmaps, args.seq)
-            
+
             # Extract first RGB frame and first heatmap
             aug_frames = tf.transpose(aug_frames, [1, 2, 0]).numpy()  # (288, 512, 9)
             aug_heatmaps = tf.transpose(aug_heatmaps, [1, 2, 0]).numpy()  # (288, 512, 3)
             frame_rgb = aug_frames[:, :, :3]  # First frame (RGB)
             heatmap_single = aug_heatmaps[:, :, 0:1]  # First heatmap
-            
+
             # Combine and save
             combine_images(frame_rgb, heatmap_single, track_id, frame_indices, DEBUG_DIR)
-            
+
         except Exception as e:
             logger.error("Failed to process track_id %s, frame_indices %s: %s",
                          track_id, frame_indices, str(e))
