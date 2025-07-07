@@ -29,6 +29,14 @@ def get_model(model_name, height, width, seq, grayscale=False):
         in_dim = seq if grayscale else 9
         out_dim = seq if grayscale else 3
         return VballNetFastV1(height, width, in_dim=in_dim, out_dim=out_dim)
+
+    if model_name == "TrackNetV4":
+        from model.TrackNetV4 import TrackNetV4 
+
+        in_dim = seq if grayscale else 9
+        out_dim = seq if grayscale else 3
+        return TrackNetV4(height, width, 'TypeB')
+
     return VballNetV1(height, width, in_dim=9, out_dim=3)
 
 
@@ -457,7 +465,7 @@ def main():
         logger.error("Sequence length must be at least 1, got %d", args.seq)
         raise ValueError(f"Invalid sequence length: {args.seq}")
 
-    if args.model_name not in ["VballNetFastV1", "VballNetV1", "PlayerNetFastV1"]:
+    if args.model_name not in ["VballNetFastV1", "VballNetV1", "PlayerNetFastV1", "TrackNetV4"]:
         logger.error(
             "Invalid model name: %s. Must be 'VballNetFastV1' or 'VballNetV1'",
             args.model_name,
