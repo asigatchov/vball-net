@@ -5,14 +5,14 @@ import argparse
 import logging
 from PIL import Image
 import matplotlib.pyplot as plt
-from constants import HEIGHT, WIDTH
-from utils import create_heatmap, SIGMA
-from train import load_image_frames, get_video_and_csv_pairs, load_data, reshape_tensors, augment_sequence
+from constants import HEIGHT, WIDTH, SIGMA
+from utils import create_heatmap
+from train_v1 import load_image_frames, get_video_and_csv_pairs, load_data, reshape_tensors, augment_sequence
 
 # Parameters
 IMG_HEIGHT = HEIGHT  # 288
 IMG_WIDTH = WIDTH  # 512
-DATASET_DIR = "/home/gled/frames"  # Base directory for frames
+DATASET_DIR = "data/frames"  # Base directory for frames
 #SIGMA = 5  # Radius for circular heatmap
 MAG = 1.0  # Magnitude for heatmap
 RATIO = 1.0  # Scaling factor for coordinates
