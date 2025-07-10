@@ -87,6 +87,7 @@ def preprocess_frame(frame, input_height=288, input_width=512):
     return frame
 
 def postprocess_output(output, threshold=0.5, input_height=288, input_width=512):
+    # Теперь возвращает: (visibility, cx, cy, bbox_x, bbox_y, bbox_w, bbox_h)
     results = []
     for frame_idx in range(3):
         heatmap = output[0, frame_idx, :, :]
@@ -99,11 +100,12 @@ def postprocess_output(output, threshold=0.5, input_height=288, input_width=512)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
                 cy = int(M["m01"] / M["m00"])
-                results.append((1, cx, cy))
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                results.append((1, cx, cy, x, y, w, h))
             else:
-                results.append((0, 0, 0))
+                results.append((0, 0, 0, 0, 0, 0, 0))
         else:
-            results.append((0, 0, 0))
+            results.append((0, 0, 0, 0, 0, 0, 0))
     return results
 
 def visualize_heatmaps(output, frame_index, input_height=288, input_width=512):
@@ -115,12 +117,16 @@ def visualize_heatmaps(output, frame_index, input_height=288, input_width=512):
         cv2.imshow(f'Heatmap Frame {frame_idx}', heatmap_color)
     cv2.waitKey(1)
 
-def draw_track(frame, track_points, current_color=(0, 0, 255), history_color=(255, 0, 0)):
+def draw_track(frame, track_points, current_color=(0, 0, 255), history_color=(255, 0, 0), current_ball_bbox=None):
     for point in list(track_points)[:-1]:
         if point is not None:
             cv2.circle(frame, point, 5, history_color, -1)
     if track_points and track_points[-1] is not None:
         cv2.circle(frame, track_points[-1], 5, current_color, -1)
+    # Draw green bounding box for current ball if provided
+    if current_ball_bbox is not None:
+        x, y, box_w, box_h = current_ball_bbox
+        cv2.rectangle(frame, (x, y), (x + box_w, y + box_h), (0, 255, 0), 2)
     return frame
 
 def main():
@@ -169,7 +175,9 @@ def main():
 
             predictions = postprocess_output(output, input_height=input_height, input_width=input_width)
 
-            visibility, x, y = predictions[2]
+            # Теперь predictions[2] содержит (visibility, x, y, bbox_x, bbox_y, bbox_w, bbox_h)
+            visibility, x, y, bbox_x, bbox_y, bbox_w, bbox_h = predictions[2]
+            current_ball_bbox = None
             if visibility == 0:
                 x_orig, y_orig = -1, -1
                 if len(track_points) > 0:
@@ -178,6 +186,12 @@ def main():
                 x_orig = x * frame_width / input_width
                 y_orig = y * frame_height / input_height
                 track_points.append((int(x_orig), int(y_orig)))
+                # Масштабируем рамку из входного размера в размер оригинального кадра
+                bbox_x_orig = int(bbox_x * frame_width / input_width)
+                bbox_y_orig = int(bbox_y * frame_height / input_height)
+                bbox_w_orig = int(bbox_w * frame_width / input_width)
+                bbox_h_orig = int(bbox_h * frame_height / input_height)
+                current_ball_bbox = (bbox_x_orig, bbox_y_orig, bbox_w_orig, bbox_h_orig)
 
             result = {
                 'Frame': frame_index,
@@ -189,9 +203,9 @@ def main():
 
             if args.visualize or out_writer is not None:
                 vis_frame = frame.copy()
-                vis_frame = draw_track(vis_frame, track_points)
+                vis_frame = draw_track(vis_frame, track_points, current_ball_bbox=current_ball_bbox)
                 if args.visualize:
-                    visualize_heatmaps(output, frame_index, input_height, input_width)
+                    #visualize_heatmaps(output, frame_index, input_height, input_width)
                     cv2.namedWindow(
                         "Ball Tracking", cv2.WINDOW_NORMAL
                     )  # Create window with freedom of dimensions
