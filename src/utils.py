@@ -9,11 +9,240 @@ import tensorflow.keras.backend as K
 import tensorflow as tf
 import logging
 import os
-from constants import CUSTOMER_DATASET_ROOT, WIDTH, HEIGHT
+from constants import CUSTOMER_DATASET_ROOT, WIDTH, HEIGHT, DATASET_DIR, IMG_FORMAT, IMG_HEIGHT, IMG_WIDTH, RATIO, MAG, SIGMA
+
 from model.VballNetV1 import VballNetV1
 import tensorflow as tf
 from tensorflow.keras.callbacks import Callback
+import pandas as pd
 
+def limit_gpu_memory(memory_limit_mb):
+    """Limit GPU memory usage for the current TensorFlow process."""
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        print("No GPUs found. Running on CPU.")
+        return
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_virtual_device_configuration(
+                gpu,
+                [
+                    tf.config.experimental.VirtualDeviceConfiguration(
+                        memory_limit=memory_limit_mb
+                    )
+                ],
+            )
+        print(f"Set GPU memory limit to {memory_limit_mb} MB")
+    except RuntimeError as e:
+        print(f"Error setting GPU memory limit: {e}")
+        raise
+
+
+def load_image_frames(
+    track_id, frame_indices, mode, height=288, width=512, grayscale=False
+):
+    """
+    Loads seq preprocessed image frames from DATASET_DIR/mode/track_id/.
+    """
+    logger = logging.getLogger(__name__)
+    frames = []
+    track_dir = os.path.join(DATASET_DIR, mode, str(track_id))
+    for idx in frame_indices:
+        frame_path = os.path.join(track_dir, f"{idx}{IMG_FORMAT}")
+        if not os.path.exists(frame_path):
+            logger.error("Frame not found at %s", frame_path)
+            raise FileNotFoundError(f"Frame not found: {frame_path}")
+        try:
+            image_string = tf.io.read_file(frame_path)
+            frame = tf.image.decode_jpeg(image_string, channels=1 if grayscale else 3)
+        except Exception as e:
+            logger.error("Failed to load or decode frame %s: %s", frame_path, str(e))
+            raise ValueError(f"Failed to load frame {frame_path}: {e}")
+
+        expected_channels = 1 if grayscale else 3
+        if len(frame.shape) != 3 or frame.shape[2] != expected_channels:
+            logger.error(
+                "Frame %s has unexpected shape %s, expected (H, W, %d)",
+                frame_path,
+                frame.shape,
+                expected_channels,
+            )
+            raise ValueError(
+                f"Frame {frame_path} has unexpected shape {frame.shape}, expected (H, W, {expected_channels})"
+            )
+
+        logger.debug("Loaded frame %s with shape %s", frame_path, frame.shape)
+        frame = tf.cast(frame, tf.float32)
+        frame = frame / 255.0
+        frames.append(frame)
+
+    try:
+        concatenated = tf.concat(frames, axis=2)
+        logger.debug(
+            "Concatenated frames shape %s for track_id %s, indices %s",
+            concatenated.shape,
+            track_id,
+            frame_indices,
+        )
+        return concatenated
+    except Exception as e:
+        logger.error(
+            "Failed to concatenate frames for track_id %s, indices %s: %s",
+            track_id,
+            frame_indices,
+            str(e),
+        )
+        raise ValueError(f"Failed to concatenate frames: {e}")
+
+
+def load_data(track_id, csv_path, frame_indices, mode, seq, grayscale=False):
+    """
+    Loads seq frames and their heatmaps for a single sequence.
+    """
+    logger = logging.getLogger(__name__)
+    if isinstance(track_id, tf.Tensor):
+        track_id = (
+            track_id.numpy().decode("utf-8")
+            if track_id.dtype == tf.string
+            else str(track_id.numpy())
+        )
+
+    if isinstance(csv_path, tf.Tensor):
+        csv_path = (
+            csv_path.numpy().decode("utf-8")
+            if csv_path.dtype == tf.string
+            else str(csv_path.numpy())
+        )
+    if isinstance(frame_indices, tf.Tensor):
+        frame_indices = frame_indices.numpy().tolist()
+
+    frames = load_image_frames(
+        track_id, frame_indices, mode, IMG_HEIGHT, IMG_WIDTH, grayscale
+    )
+    df = pd.read_csv(
+        csv_path,
+        dtype={"Frame": np.int64, "X": np.int64, "Y": np.int64, "Visibility": np.int64},
+    )
+    df = df.fillna({"X": 0, "Y": 0, "Visibility": 0})
+    heatmaps = []
+    for idx in frame_indices:
+        if idx >= len(df):
+            logger.error("Frame index %d out of range for CSV %s", idx, csv_path)
+            raise IndexError(f"Frame index {idx} out of range for CSV {csv_path}")
+        row = df[df["Frame"] == idx]
+        if row.empty:
+            logger.warning(
+                "No data for frame %d in %s, setting heatmap to zero", idx, csv_path
+            )
+            heatmap = tf.zeros((IMG_HEIGHT, IMG_WIDTH, 1), dtype=tf.float32)
+        else:
+            x, y, visibility = (
+                row["X"].iloc[0],
+                row["Y"].iloc[0],
+                row["Visibility"].iloc[0],
+            )
+            if not isinstance(visibility, (int, np.int64)) or visibility not in [0, 1]:
+                logger.warning(
+                    "Invalid visibility %s at frame %d in %s, setting to 0",
+                    visibility,
+                    idx,
+                    csv_path,
+                )
+                visibility = 0
+            x = x / RATIO
+            y = y / RATIO
+            if x < 0 or y < 0 or x >= IMG_WIDTH or y >= IMG_HEIGHT:
+                heatmap = tf.zeros((IMG_HEIGHT, IMG_WIDTH, 1), dtype=tf.float32)
+            else:
+                heatmap = create_heatmap(
+                    x, y, visibility, IMG_HEIGHT, IMG_WIDTH, SIGMA, MAG
+                )
+        heatmaps.append(heatmap)
+
+    heatmaps = tf.concat(heatmaps, axis=2)
+    frames.set_shape([IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)])
+    heatmaps.set_shape([IMG_HEIGHT, IMG_WIDTH, seq])
+    logger.debug(
+        "Loaded data for track_id %s: frames shape %s, heatmaps shape %s",
+        track_id,
+        frames.shape,
+        heatmaps.shape,
+    )
+    return frames, heatmaps
+
+
+def get_video_and_csv_pairs(mode, seq):
+    """
+    Returns a list of (track_id, csv_path, frame_indices) tuples for videos in DATASET_DIR/mode.
+    """
+    logger = logging.getLogger(__name__)
+    pairs = []
+    mode_dir = os.path.join(DATASET_DIR, mode)
+    if not os.path.exists(mode_dir):
+        logger.warning("Directory %s does not exist", mode_dir)
+        return pairs
+
+    video_dirs = [
+        d for d in os.listdir(mode_dir) if os.path.isdir(os.path.join(mode_dir, d))
+    ]
+    for track_id in video_dirs:
+        csv_path = os.path.join(mode_dir, f"{track_id}_ball.csv")
+        if not os.path.exists(csv_path):
+            logger.warning(
+                "CSV not found for track_id %s at %s, skipping", track_id, csv_path
+            )
+            continue
+        df = pd.read_csv(
+            csv_path,
+            dtype={
+                "Frame": np.int64,
+                "X": np.int64,
+                "Y": np.int64,
+                "Visibility": np.int64,
+            },
+        )
+        df = df.fillna({"X": 0, "Y": 0, "Visibility": 0})
+
+        if not np.all(df["Frame"].values == np.arange(len(df))):
+            logger.warning("Non-sequential frame indices in %s, skipping", csv_path)
+            continue
+
+        num_frames = len(df)
+        if num_frames < seq:
+            logger.warning(
+                "%s has %d frames, need at least %d, skipping",
+                csv_path,
+                num_frames,
+                seq,
+            )
+            continue
+        for t in range(seq - 1, num_frames):
+            frame_indices = list(range(t - seq + 1, t + 1))
+            if max(frame_indices) >= len(df):
+                logger.warning(
+                    "Frame indices %s exceed CSV length %d for %s, skipping",
+                    frame_indices,
+                    len(df),
+                    csv_path,
+                )
+                continue
+            track_dir = os.path.join(mode_dir, track_id)
+            missing = [
+                idx
+                for idx in frame_indices
+                if not os.path.exists(os.path.join(track_dir, f"{idx}{IMG_FORMAT}"))
+            ]
+            if missing:
+                logger.warning(
+                    "Missing frames %s for track_id %s, skipping sequence %s",
+                    missing,
+                    track_id,
+                    frame_indices,
+                )
+                continue
+            pairs.append((track_id, csv_path, frame_indices))
+    logger.debug("Found %d valid pairs for mode %s", len(pairs), mode)
+    return pairs
 
 
 def create_heatmap(x, y, visibility, height=288, width=512, r=5, mag=1.0):
@@ -23,7 +252,7 @@ def create_heatmap(x, y, visibility, height=288, width=512, r=5, mag=1.0):
     logger = logging.getLogger(__name__)
     visibility = tf.cast(visibility, tf.int32)
     if visibility == 0 or x <= 0 or y <= 0:
-        #logger.debug("Zero heatmap due to visibility=0 or invalid coordinates (x=%s, y=%s)", x, y)
+        # logger.debug("Zero heatmap due to visibility=0 or invalid coordinates (x=%s, y=%s)", x, y)
         return tf.zeros((height, width, 1), dtype=tf.float32)
 
     x = tf.cast(x, tf.float32)
@@ -50,6 +279,71 @@ def create_heatmap(x, y, visibility, height=288, width=512, r=5, mag=1.0):
     logger.debug("Created heatmap with shape %s", heatmap.shape)
     tf.debugging.assert_shapes([(heatmap, (height, width, 1))])
     return heatmap
+
+class VisualizationCallback(tf.keras.callbacks.Callback):
+    def __init__(
+        self,
+        test_dataset,
+        save_dir="visualizations",
+        seq=3,
+        buffer_size=1,
+        grayscale=False,
+    ):
+        super().__init__()
+        self.test_dataset = test_dataset
+        self.save_dir = save_dir
+        self.seq = seq
+        self.buffer_size = buffer_size
+        self.grayscale = grayscale
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def on_epoch_end(self, epoch, logs=None):
+        logger = logging.getLogger(__name__)
+        for frames, heatmaps in self.test_dataset.shuffle(self.buffer_size):
+            frames = tf.transpose(frames, [0, 2, 3, 1])
+            pred_heatmaps = self.model.predict(frames, verbose=0)
+            frames_np = frames[0].numpy()
+            heatmaps_np = heatmaps[0].numpy()
+            pred_heatmaps_np = pred_heatmaps[0]
+
+            for i in range(self.seq):
+                if self.grayscale:
+                    frame = frames_np[:, :, i : i + 1]
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                    frame = tf.convert_to_tensor(frame_rgb, dtype=tf.float32)
+                    frame = tf.ensure_shape(frame, [288, 512, 3])
+                else:
+                    frame = frames_np[:, :, i * 3 : (i + 1) * 3]
+                    frame = tf.convert_to_tensor(frame, dtype=tf.float32)
+                    frame = tf.ensure_shape(frame, [288, 512, 3])
+
+                try:
+                    true_heatmap = heatmaps_np[i, :, :]
+                    pred_heatmap = pred_heatmaps_np[i, :, :]
+                    frame = tf.cast(frame * 255, tf.uint8)
+                    true_heatmap = tf.cast(true_heatmap * 255, tf.uint8)
+                    pred_heatmap = tf.cast(pred_heatmap * 255, tf.uint8)
+                    true_heatmap = tf.expand_dims(true_heatmap, axis=-1)
+                    pred_heatmap = tf.expand_dims(pred_heatmap, axis=-1)
+                    true_heatmap = tf.image.grayscale_to_rgb(true_heatmap)
+                    pred_heatmap = tf.image.grayscale_to_rgb(pred_heatmap)
+                    combined = tf.concat(
+                        [frame, true_heatmap, pred_heatmap], axis=1
+                    )
+                    tf.io.write_file(
+                        os.path.join(
+                            self.save_dir, f"vis_epoch_{epoch:03d}_frame_{i}.png"
+                        ),
+                        tf.image.encode_png(combined),
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to save visualization for epoch %d, frame %d: %s",
+                        epoch,
+                        i,
+                        str(e),
+                    )
+                    continue
 
 
 ####################################
@@ -198,8 +492,6 @@ class OutcomeMetricsCallback(Callback):
             total_FP2,
             total_FN,
         )
-
-
 
 
 def custom_loss(y_true, y_pred):

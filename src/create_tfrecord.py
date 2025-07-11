@@ -3,13 +3,15 @@ import os
 import pandas as pd
 import numpy as np
 import logging
-from constants import HEIGHT, WIDTH
+import cv2
+from constants import HEIGHT, WIDTH, SIGMA
 
 # Configuration
 DATASET_DIR = "./data/frames"
 TFRECORD_DIR = "./data/tfrecords"
 IMG_HEIGHT = HEIGHT  # 288
 IMG_WIDTH = WIDTH   # 512
+MAG = 1.0  # Intensity of the heatmap circle
 
 def setup_logging():
     """
@@ -36,10 +38,46 @@ def _int64_feature(value):
     """
     return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
 
+def create_heatmap(x, y, visibility, height=IMG_HEIGHT, width=IMG_WIDTH, r=SIGMA, mag=MAG):
+    """
+    Create a heatmap using cv2.circle for the given coordinates and visibility.
+    Args:
+        x (int): X-coordinate of the circle center.
+        y (int): Y-coordinate of the circle center.
+        visibility (int): Visibility flag (0 or 1).
+        height (int): Height of the heatmap.
+        width (int): Width of the heatmap.
+        r (int): Radius of the circle (from SIGMA).
+        mag (float): Intensity of the circle (from MAG).
+    Returns:
+        bytes: PNG-encoded heatmap image.
+    """
+    logger = logging.getLogger(__name__)
+    # Initialize a zero heatmap
+    heatmap = np.zeros((height, width), dtype=np.float32)
+
+    # Only draw circle if visibility is 1 and coordinates are valid
+    if visibility == 1 and x > 0 and y > 0 and x < width and y < height:
+        cv2.circle(
+            heatmap,
+            center=(int(x), int(y)),
+            radius=int(r),
+            color=mag,
+            thickness=-1  # Filled circle
+        )
+
+    # Ensure heatmap is single-channel and in range [0, 1]
+    heatmap = np.clip(heatmap, 0, 1)
+    # Convert to uint8 for PNG encoding
+    heatmap_uint8 = (heatmap * 255).astype(np.uint8)
+    # Encode as PNG
+    _, encoded_heatmap = cv2.imencode('.png', heatmap_uint8)
+    logger.debug(f"Created heatmap for x={x}, y={y}, visibility={visibility}, shape={heatmap.shape}")
+    return encoded_heatmap.tobytes()
+
 def create_tfrecord(data_dir, mode, output_path, grayscale=False):
     """
     Convert PNG images and CSV annotations to TFRecord for a given mode (train/test).
-    
     Args:
         data_dir (str): Base directory containing train/test folders.
         mode (str): 'train' or 'test'.
@@ -49,7 +87,7 @@ def create_tfrecord(data_dir, mode, output_path, grayscale=False):
     logger = setup_logging()
     logger.info(f"Creating TFRecord for {mode} at {output_path}")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+
     with tf.io.TFRecordWriter(output_path) as writer:
         mode_dir = os.path.join(data_dir, mode)
         if not os.path.exists(mode_dir):
@@ -100,14 +138,21 @@ def create_tfrecord(data_dir, mode, output_path, grayscale=False):
                         logger.warning(f"Frame {frame_path} is not RGB")
                         continue
 
+                    # Create heatmap
+                    x = df.iloc[idx]["X"]
+                    y = df.iloc[idx]["Y"]
+                    visibility = 1 if df.iloc[idx]["Visibility"] >= 1 else 0
+                    heatmap_string = create_heatmap(x, y, visibility)
+
                     # Create TFRecord example
                     example = tf.train.Example(features=tf.train.Features(feature={
                         'track_id': _bytes_feature(track_id),
                         'frame_idx': _int64_feature(idx),
                         'image': _bytes_feature(image_string.numpy()),
-                        'x': _int64_feature(df.iloc[idx]["X"]),
-                        'y': _int64_feature(df.iloc[idx]["Y"]),
-                        'visibility': _int64_feature(df.iloc[idx]["Visibility"])
+                        'x': _int64_feature(x),
+                        'y': _int64_feature(y),
+                        'visibility': _int64_feature(visibility),
+                        'heatmap': _bytes_feature(heatmap_string)
                     }))
                     writer.write(example.SerializeToString())
                     logger.debug(f"Wrote frame {idx} for track_id {track_id}")
@@ -123,15 +168,15 @@ def main():
     """
     logger = setup_logging()
     logger.info("Starting TFRecord creation")
-    
+
     # Create TFRecords for RGB
     create_tfrecord(DATASET_DIR, "train", os.path.join(TFRECORD_DIR, "train.tfrecord"), grayscale=False)
     create_tfrecord(DATASET_DIR, "test", os.path.join(TFRECORD_DIR, "test.tfrecord"), grayscale=False)
-    
+
     # Optionally create TFRecords for grayscale if needed
     # create_tfrecord(DATASET_DIR, "train", os.path.join(TFRECORD_DIR, "train_grayscale.tfrecord"), grayscale=True)
     # create_tfrecord(DATASET_DIR, "test", os.path.join(TFRECORD_DIR, "test_grayscale.tfrecord"), grayscale=True)
-    
+
     logger.info("TFRecord creation completed")
 
 if __name__ == "__main__":

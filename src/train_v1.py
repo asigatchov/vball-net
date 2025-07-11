@@ -8,61 +8,15 @@ import argparse
 import logging
 from datetime import datetime
 import glob
-from constants import HEIGHT, WIDTH, SIGMA
-from utils import create_heatmap, custom_loss, OutcomeMetricsCallback
+from constants import HEIGHT, WIDTH, SIGMA, DATASET_DIR , IMG_FORMAT
+from utils import create_heatmap, custom_loss, limit_gpu_memory, OutcomeMetricsCallback, VisualizationCallback
 
-
-def limit_gpu_memory(memory_limit_mb):
-    """Limit GPU memory usage for the current TensorFlow process."""
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_virtual_device_configuration(
-                    gpu,
-                    [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=memory_limit_mb)]
-                )
-            print(f"Set GPU memory limit to {memory_limit_mb} MB")
-        except RuntimeError as e:
-            print(f"Error setting GPU memory limit: {e}")
-
-
-# Import get_model function
-def get_model(model_name, height, width, seq, grayscale=False):
-    """
-    Retrieve an instance of a TrackNet model based on the specified model name.
-    """
-    from model.VballNetFastV1 import VballNetFastV1
-    from model.VballNetV1 import VballNetV1
-
-    if model_name == "PlayerNetFastV1":
-        from model.PlayerNetFastV1 import PlayerNetFastV1
-
-        return PlayerNetFastV1(input_shape=(9, height, width), output_channels=3)
-
-    if model_name == "VballNetFastV1":
-        in_dim = seq if grayscale else 9
-        out_dim = seq if grayscale else 3
-        return VballNetFastV1(height, width, in_dim=in_dim, out_dim=out_dim)
-
-    if model_name == "TrackNetV4":
-        from model.TrackNetV4 import TrackNetV4 
-
-        in_dim = seq if grayscale else 9
-        out_dim = seq if grayscale else 3
-        return TrackNetV4(height, width, 'TypeB')
-
-    in_dim = seq if grayscale else 9
-    out_dim = seq if grayscale else 3
-    return VballNetV1(height, width, in_dim=in_dim, out_dim=out_dim)
-
+from utils import get_video_and_csv_pairs, load_data
 
 # Parameters
 IMG_HEIGHT = HEIGHT  # 288
 IMG_WIDTH = WIDTH  # 512
-IMG_FORMAT = ".png"
-BATCH_SIZE = 10  # Reduced for stability
-DATASET_DIR = "./data/frames"  # Base directory for frames
+BATCH_SIZE = 4  # Reduced for stability
 MAG = 1.0  # Magnitude for heatmap
 RATIO = 1.0  # Scaling factor for coordinates
 MODEL_DIR = "models"  # Directory for model saving
@@ -82,220 +36,32 @@ def setup_logging(debug=False):
     return logger
 
 
-def load_image_frames(
-    track_id, frame_indices, mode, height=288, width=512, grayscale=False
-):
+logger = setup_logging()
+
+# Import get_model function
+def get_model(model_name, height, width, seq, grayscale=False):
     """
-    Loads seq preprocessed image frames from DATASET_DIR/mode/track_id/.
+    Retrieve an instance of a TrackNet model based on the specified model name.
     """
-    logger = logging.getLogger(__name__)
-    frames = []
-    track_dir = os.path.join(DATASET_DIR, mode, str(track_id))
-    for idx in frame_indices:
-        frame_path = os.path.join(track_dir, f"{idx}{IMG_FORMAT}")
-        if not os.path.exists(frame_path):
-            logger.error("Frame not found at %s", frame_path)
-            raise FileNotFoundError(f"Frame not found: {frame_path}")
 
-        try:
-            image_string = tf.io.read_file(frame_path)
-            frame = tf.image.decode_jpeg(image_string, channels=1 if grayscale else 3)
-        except Exception as e:
-            logger.error("Failed to load or decode frame %s: %s", frame_path, str(e))
-            raise ValueError(f"Failed to load frame {frame_path}: {e}")
-
-        expected_channels = 1 if grayscale else 3
-        if len(frame.shape) != 3 or frame.shape[2] != expected_channels:
-            logger.error(
-                "Frame %s has unexpected shape %s, expected (H, W, %d)",
-                frame_path,
-                frame.shape,
-                expected_channels,
-            )
-            raise ValueError(
-                f"Frame {frame_path} has unexpected shape {frame.shape}, expected (H, W, {expected_channels})"
-            )
-
-        logger.debug("Loaded frame %s with shape %s", frame_path, frame.shape)
-        frame = tf.cast(frame, tf.float32)
-        frame = frame / 255.0
-        frames.append(frame)
-
-    try:
-        concatenated = tf.concat(frames, axis=2)
-        logger.debug(
-            "Concatenated frames shape %s for track_id %s, indices %s",
-            concatenated.shape,
-            track_id,
-            frame_indices,
-        )
-        return concatenated
-    except Exception as e:
-        logger.error(
-            "Failed to concatenate frames for track_id %s, indices %s: %s",
-            track_id,
-            frame_indices,
-            str(e),
-        )
-        raise ValueError(f"Failed to concatenate frames: {e}")
+    in_dim = seq if grayscale else seq * 3
+    out_dim = seq
 
 
-def get_video_and_csv_pairs(mode, seq):
-    """
-    Returns a list of (track_id, csv_path, frame_indices) tuples for videos in DATASET_DIR/mode.
-    """
-    logger = logging.getLogger(__name__)
-    pairs = []
-    mode_dir = os.path.join(DATASET_DIR, mode)
-    if not os.path.exists(mode_dir):
-        logger.warning("Directory %s does not exist", mode_dir)
-        return pairs
+    from model.VballNetFastV1 import VballNetFastV1
+    from model.VballNetV1 import VballNetV1
 
-    video_dirs = [
-        d for d in os.listdir(mode_dir) if os.path.isdir(os.path.join(mode_dir, d))
-    ]
-    for track_id in video_dirs:
-        csv_path = os.path.join(mode_dir, f"{track_id}_ball.csv")
-        if not os.path.exists(csv_path):
-            logger.warning(
-                "CSV not found for track_id %s at %s, skipping", track_id, csv_path
-            )
-            continue
-        df = pd.read_csv(
-            csv_path,
-            dtype={
-                "Frame": np.int64,
-                "X": np.int64,
-                "Y": np.int64,
-                "Visibility": np.int64,
-            },
-        )
-        df = df.fillna({"X": 0, "Y": 0, "Visibility": 0})
+    if model_name == "PlayerNetFastV1":
+        from model.PlayerNetFastV1 import PlayerNetFastV1
+        return PlayerNetFastV1(input_shape=(9, height, width), output_channels=3)
 
-        if not np.all(df["Frame"].values == np.arange(len(df))):
-            logger.warning("Non-sequential frame indices in %s, skipping", csv_path)
-            continue
+    if model_name == "VballNetFastV1":
+        return VballNetFastV1(height, width, in_dim=in_dim, out_dim=out_dim)
 
-        num_frames = len(df)
-        if num_frames < seq:
-            logger.warning(
-                "%s has %d frames, need at least %d, skipping",
-                csv_path,
-                num_frames,
-                seq,
-            )
-            continue
-        for t in range(seq - 1, num_frames):
-            frame_indices = list(range(t - seq + 1, t + 1))
-            if max(frame_indices) >= len(df):
-                logger.warning(
-                    "Frame indices %s exceed CSV length %d for %s, skipping",
-                    frame_indices,
-                    len(df),
-                    csv_path,
-                )
-                continue
-            track_dir = os.path.join(mode_dir, track_id)
-            missing = [
-                idx
-                for idx in frame_indices
-                if not os.path.exists(os.path.join(track_dir, f"{idx}{IMG_FORMAT}"))
-            ]
-            if missing:
-                logger.warning(
-                    "Missing frames %s for track_id %s, skipping sequence %s",
-                    missing,
-                    track_id,
-                    frame_indices,
-                )
-                continue
-            pairs.append((track_id, csv_path, frame_indices))
-    logger.debug("Found %d valid pairs for mode %s", len(pairs), mode)
-    return pairs
-
-
-def load_data(track_id, csv_path, frame_indices, mode, seq, grayscale=False):
-    """
-    Loads seq frames and their heatmaps for a single sequence.
-    """
-    logger = logging.getLogger(__name__)
-    if isinstance(track_id, tf.Tensor):
-        track_id = (
-            track_id.numpy().decode("utf-8")
-            if track_id.dtype == tf.string
-            else str(track_id.numpy())
-        )
-    if isinstance(csv_path, tf.Tensor):
-        csv_path = (
-            csv_path.numpy().decode("utf-8")
-            if csv_path.dtype == tf.string
-            else str(csv_path.numpy())
-        )
-    if isinstance(frame_indices, tf.Tensor):
-        frame_indices = frame_indices.numpy().tolist()
-
-    frames = load_image_frames(
-        track_id, frame_indices, mode, IMG_HEIGHT, IMG_WIDTH, grayscale
-    )
-    df = pd.read_csv(
-        csv_path,
-        dtype={"Frame": np.int64, "X": np.int64, "Y": np.int64, "Visibility": np.int64},
-    )
-    df = df.fillna({"X": 0, "Y": 0, "Visibility": 0})
-    heatmaps = []
-    for idx in frame_indices:
-        if idx >= len(df):
-            logger.error("Frame index %d out of range for CSV %s", idx, csv_path)
-            raise IndexError(f"Frame index {idx} out of range for CSV {csv_path}")
-        row = df[df["Frame"] == idx]
-        if row.empty:
-            logger.warning(
-                "No data for frame %d in %s, setting heatmap to zero", idx, csv_path
-            )
-            heatmap = tf.zeros((IMG_HEIGHT, IMG_WIDTH, 1), dtype=tf.float32)
-        else:
-            x, y, visibility = (
-                row["X"].iloc[0],
-                row["Y"].iloc[0],
-                row["Visibility"].iloc[0],
-            )
-            if not isinstance(visibility, (int, np.int64)) or visibility not in [0, 1]:
-                logger.warning(
-                    "Invalid visibility %s at frame %d in %s, setting to 0",
-                    visibility,
-                    idx,
-                    csv_path,
-                )
-                visibility = 0
-            x = x / RATIO
-            y = y / RATIO
-            if x < 0 or y < 0 or x >= IMG_WIDTH or y >= IMG_HEIGHT:
-                if x >= IMG_WIDTH or y >= IMG_HEIGHT:
-                    logger.warning(
-                        "Coordinates out of bounds (x=%s, y=%s) at frame %d in %s, setting heatmap to zero",
-                        x,
-                        y,
-                        idx,
-                        csv_path,
-                    )
-                heatmap = tf.zeros((IMG_HEIGHT, IMG_WIDTH, 1), dtype=tf.float32)
-            else:
-                heatmap = create_heatmap(
-                    x, y, visibility, IMG_HEIGHT, IMG_WIDTH, SIGMA, MAG
-                )
-        heatmaps.append(heatmap)
-
-    heatmaps = tf.concat(heatmaps, axis=2)
-    frames.set_shape([IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)])
-    heatmaps.set_shape([IMG_HEIGHT, IMG_WIDTH, seq])
-    logger.debug(
-        "Loaded data for track_id %s: frames shape %s, heatmaps shape %s",
-        track_id,
-        frames.shape,
-        heatmaps.shape,
-    )
-    return frames, heatmaps
-
+    if model_name == "TrackNetV4":
+        from model.TrackNetV4 import TrackNetV4
+        return TrackNetV4(height, width, 'TypeB')
+    return VballNetV1(height, width, in_dim=in_dim, out_dim=out_dim)
 
 def reshape_tensors(frames, heatmaps, seq, grayscale=False):
     """
@@ -330,12 +96,12 @@ def mixup(frames, heatmaps, alpha=0.5):
     logger = logging.getLogger(__name__)
     batch_size = tf.shape(frames)[0]
 
-    # Generate lambda from beta distribution
-    lamb = tf.random.stateless_beta([alpha, alpha], shape=[batch_size], seed=(123, 456))
+    # Use tf.random.gamma to sample from Beta(alpha, alpha)
+    gamma1 = tf.random.gamma(shape=[batch_size], alpha=alpha)
+    gamma2 = tf.random.gamma(shape=[batch_size], alpha=alpha)
+    lamb = gamma1 / (gamma1 + gamma2)
     lamb = tf.maximum(lamb, 1.0 - lamb)  # Ensure lambda >= 0.5
-    lamb = tf.expand_dims(
-        tf.expand_dims(tf.expand_dims(lamb, -1), -1), -1
-    )  # Shape: (batch_size, 1, 1, 1)
+    lamb = tf.reshape(lamb, [batch_size, 1, 1, 1])  # Shape: (batch_size, 1, 1, 1)
 
     # Randomly permute batch indices
     indices = tf.random.shuffle(tf.range(batch_size))
@@ -390,15 +156,6 @@ def augment_sequence(frames, heatmaps, seq, grayscale=False, alpha=-1.0):
         combined = tf.image.random_flip_left_right(combined, seed=None)
         logger.debug("After flip: combined shape %s", combined.shape)
 
-        # Apply random rotation up to 20 degrees
-        angle = tf.random.uniform([], minval=-20, maxval=20, dtype=tf.float32) * (
-            3.14159 / 180
-        )
-        combined = tf.image.rot90(
-            combined, k=tf.cast(tf.round(angle / (3.14159 / 2)), tf.int32)
-        )
-        logger.debug("After rotation: combined shape %s", combined.shape)
-
         # Split back to framesfera and heatmaps
         frames = combined[
             :, :, : seq * (1 if grayscale else 3)
@@ -431,7 +188,7 @@ def augment_sequence(frames, heatmaps, seq, grayscale=False, alpha=-1.0):
 
 def main():
 
-    limit_gpu_memory(10240)
+
     logger = logging.getLogger(__name__)
 
     parser = argparse.ArgumentParser(description="Train VballNet model.")
@@ -467,19 +224,29 @@ def main():
         default=-1.0,
         help="Alpha for mixup augmentation, -1 means no mixup.",
     )
+
+    parser.add_argument(
+        "--gpu_memory_limit",
+        type=int,
+        default=-1,
+        help="Limit GPU memory usage in MB, -1 means no limit.",
+    )
+
     args = parser.parse_args()
 
-    setup_logging(args.debug)
     logger.info(
-        "Starting training script with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s",
+        "Starting training script with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s gpu_memory_limit=%d",
         args.seq,
         args.grayscale,
         args.debug,
         args.resume,
         args.model_name,
         args.alpha,
+        args.gpu_memory_limit,
     )
 
+
+    limit_gpu_memory(args.gpu_memory_limit)
     if args.seq < 1:
         logger.error("Sequence length must be at least 1, got %d", args.seq)
         raise ValueError(f"Invalid sequence length: {args.seq}")
@@ -646,126 +413,6 @@ def main():
             current_step = epoch * self.train_size
             current_lr = self.lr_schedule(current_step).numpy()
             logger.info(f"Epoch {epoch + 1}: Learning rate = {current_lr}")
-
-    class VisualizationCallback(tf.keras.callbacks.Callback):
-        def __init__(
-            self,
-            test_dataset,
-            save_dir="visualizations",
-            seq=4,
-            buffer_size=1,
-            grayscale=False,
-        ):
-            super().__init__()
-            self.test_dataset = test_dataset
-            self.save_dir = save_dir
-            self.seq = seq
-            self.buffer_size = buffer_size
-            self.grayscale = grayscale
-            os.makedirs(self.save_dir, exist_ok=True)
-
-        def on_epoch_end(self, epoch, logs=None):
-            logger = logging.getLogger(__name__)
-
-            for frames, heatmaps in self.test_dataset.shuffle(self.buffer_size):
-                frames = tf.transpose(
-                    frames, [0, 2, 3, 1]
-                )  # (batch_size, 288, 512, seq*(1 or 3))
-                pred_heatmaps = self.model.predict(
-                    frames, verbose=0
-                )  # (batch_size, seq, 288, 512)
-
-                frames_np = frames[0].numpy()  # (288, 512, seq*(1 or 3))
-                heatmaps_np = heatmaps[0].numpy()  # (seq, 288, 512)
-                pred_heatmaps_np = pred_heatmaps[0]  # (seq, 288, 512)
-
-                logger.debug(
-                    "frames_np shape: %s, type: %s", frames_np.shape, type(frames_np)
-                )
-                logger.debug(
-                    "heatmaps_np shape: %s, type: %s",
-                    heatmaps_np.shape,
-                    type(heatmaps_np),
-                )
-                logger.debug(
-                    "pred_heatmaps_np shape: %s, type: %s",
-                    pred_heatmaps_np.shape,
-                    type(pred_heatmaps_np),
-                )
-
-                for i in range(self.seq):
-                    if self.grayscale:
-                        frame = frames_np[:, :, i : i + 1]  # (288, 512, 1)
-                        logger.debug("Grayscale frame slice shape: %s", frame.shape)
-                        if frame.shape[-1] != 1:
-                            logger.error(
-                                "Unexpected frame shape %s, expected last dimension to be 1",
-                                frame.shape,
-                            )
-                            raise ValueError(
-                                f"Unexpected frame shape {frame.shape}, expected last dimension to be 1"
-                            )
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-                        frame = tf.convert_to_tensor(frame_rgb, dtype=tf.float32)
-                        frame = tf.ensure_shape(frame, [288, 512, 3])
-                    else:
-                        frame = frames_np[:, :, i * 3 : (i + 1) * 3]  # (288, 512, 3)
-                        logger.debug("RGB frame slice shape: %s", frame.shape)
-                        if frame.shape[-1] != 3:
-                            logger.error(
-                                "Unexpected frame shape %s, expected last dimension to be 3",
-                                frame.shape,
-                            )
-                            raise ValueError(
-                                f"Unexpected frame shape {frame.shape}, expected last dimension to be 3"
-                            )
-                        frame = tf.convert_to_tensor(frame, dtype=tf.float32)
-                        frame = tf.ensure_shape(frame, [288, 512, 3])
-
-                    try:
-                        true_heatmap = heatmaps_np[i, :, :]  # (288, 512)
-                        pred_heatmap = pred_heatmaps_np[i, :, :]  # (288, 512)
-                        logger.debug("true_heatmap shape: %s", true_heatmap.shape)
-                        logger.debug("pred_heatmap shape: %s", pred_heatmap.shape)
-
-                        frame = tf.cast(frame * 255, tf.uint8)
-                        true_heatmap = tf.convert_to_tensor(
-                            true_heatmap, dtype=tf.float32
-                        )
-                        pred_heatmap = tf.convert_to_tensor(
-                            pred_heatmap, dtype=tf.float32
-                        )
-                        true_heatmap = tf.cast(true_heatmap * 255, tf.uint8)
-                        pred_heatmap = tf.cast(pred_heatmap * 255, tf.uint8)
-
-                        true_heatmap = tf.ensure_shape(true_heatmap, [288, 512])
-                        pred_heatmap = tf.ensure_shape(pred_heatmap, [288, 512])
-                        true_heatmap = tf.expand_dims(true_heatmap, axis=-1)
-                        pred_heatmap = tf.expand_dims(pred_heatmap, axis=-1)
-                        true_heatmap = tf.image.grayscale_to_rgb(true_heatmap)
-                        pred_heatmap = tf.image.grayscale_to_rgb(pred_heatmap)
-
-                        combined = tf.concat(
-                            [frame, true_heatmap, pred_heatmap], axis=1
-                        )  # (288, 1536, 3)
-
-                        tf.io.write_file(
-                            os.path.join(
-                                self.save_dir, f"vis_epoch_{epoch:03d}_frame_{i}.png"
-                            ),
-                            tf.image.encode_png(combined),
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Failed to save visualization for epoch %d, frame %d: %s",
-                            epoch,
-                            i,
-                            str(e),
-                        )
-                        logger.debug("frames_np shape: %s", frames_np.shape)
-                        logger.debug("true_heatmap shape: %s", true_heatmap.shape)
-                        logger.debug("pred_heatmap shape: %s", pred_heatmap.shape)
-                        continue
 
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
