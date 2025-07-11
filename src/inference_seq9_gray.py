@@ -200,7 +200,8 @@ def main():
     frame_index = 0
 
     # Определяем out_dim в зависимости от модели
-    out_dim = 9 if "VballNetFastV1_seq9_grayscale" in args.model_path else 3
+    out_dim = 9 if "seq9_grayscale" in args.model_path else 3
+
 
     pbar = tqdm(total=total_frames, desc="Processing video", unit="frame")
 
@@ -233,6 +234,7 @@ def main():
                 out_dim=out_dim,
             )
             # Выбираем предсказание для последнего кадра
+            print(f"Frame {frame_index}: Predictions: {predictions}")
             visibility, x, y = predictions[-1]
 
             if visibility == 0:

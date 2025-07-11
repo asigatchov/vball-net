@@ -61,6 +61,8 @@ def get_model(model_name, height, width, seq, grayscale=False):
     if model_name == "TrackNetV4":
         from model.TrackNetV4 import TrackNetV4
         return TrackNetV4(height, width, 'TypeB')
+
+    print(f"Creating model {model_name} with height={height}, width={width}, in_dim={in_dim}, out_dim={out_dim}, seq={seq}, grayscale={grayscale}")
     return VballNetV1(height, width, in_dim=in_dim, out_dim=out_dim)
 
 def reshape_tensors(frames, heatmaps, seq, grayscale=False):

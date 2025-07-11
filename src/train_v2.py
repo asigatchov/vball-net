@@ -2,233 +2,64 @@ import tensorflow as tf
 import tensorflow.keras.backend as K
 import pandas as pd
 import numpy as np
+import cv2
 import os
 import argparse
 import logging
 from datetime import datetime
 import glob
-from constants import HEIGHT, WIDTH, SIGMA
-from utils import custom_loss, OutcomeMetricsCallback
+from constants import HEIGHT, WIDTH, SIGMA, DATASET_DIR, IMG_FORMAT
+from utils import (
+    create_heatmap,
+    custom_loss,
+    limit_gpu_memory,
+    OutcomeMetricsCallback,
+    VisualizationCallback,
+)
+from utils import get_video_and_csv_pairs, load_data
+import multiprocessing as mp
+from multiprocessing import Manager, Barrier
 
-def setup_logging(debug=False):
+# Parameters
+IMG_HEIGHT = HEIGHT  # 288
+IMG_WIDTH = WIDTH  # 512
+BATCH_SIZE = 4  # Reduced for stability
+MAG = 1.0  # Magnitude for heatmap
+RATIO = 1.0  # Scaling factor for coordinates
+MODEL_DIR = "models"  # Directory for model saving
+
+
+def setup_logging(debug=False, process_id=0):
     """
-    Configure logging with specified level based on debug flag.
+    Configure logging with specified level based on debug flag and process ID.
     """
     level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        format=f"[Process {process_id}] %(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger = logging.getLogger(__name__)
     return logger
 
-logger = setup_logging()
-
-def limit_gpu_memory(memory_limit_mb):
-    """Limit GPU memory usage for the current TensorFlow process."""
-    gpus = tf.config.list_physical_devices("GPU")
-    if not gpus:
-        logger.warning("No GPUs found. Running on CPU.")
-        return
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_virtual_device_configuration(
-                gpu,
-                [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=memory_limit_mb)]
-            )
-        logger.info(f"Set GPU memory limit to {memory_limit_mb} MB")
-    except RuntimeError as e:
-        logger.error(f"Error setting GPU memory limit: {e}")
-        raise
 
 def get_model(model_name, height, width, seq, grayscale=False):
     """
     Retrieve an instance of a TrackNet model based on the specified model name.
+    For grayscale mode with seq=9, set out_dim=9.
     """
-    from model.VballNetFastV1 import VballNetFastV1
+    in_dim = seq if grayscale else seq * 3
+    out_dim = (
+        seq  # For grayscale, out_dim=seq (e.g., 9 for seq=9); for RGB, out_dim=seq
+    )
     from model.VballNetV1 import VballNetV1
 
-    if model_name == "PlayerNetFastV1":
-        from model.PlayerNetFastV1 import PlayerNetFastV1
-        return PlayerNetFastV1(input_shape=(9, height, width), output_channels=3)
-
-    if model_name == "VballNetFastV1":
-        in_dim = seq if grayscale else 9
-        out_dim = seq if grayscale else 3
-        return VballNetFastV1(height, width, in_dim=in_dim, out_dim=out_dim)
-
-    if model_name == "TrackNetV4":
-        from model.TrackNetV4 import TrackNetV4
-        in_dim = seq if grayscale else 9
-        out_dim = seq if grayscale else 3
-        return TrackNetV4(height, width, "TypeB")
-
-    in_dim = seq if grayscale else 9
-    out_dim = seq if grayscale else 3
+    logger = logging.getLogger(__name__)
+    logger.info(
+        f"Creating model {model_name} with in_dim={in_dim}, out_dim={out_dim}, grayscale={grayscale}"
+    )
     return VballNetV1(height, width, in_dim=in_dim, out_dim=out_dim)
 
-# Parameters
-IMG_HEIGHT = HEIGHT  # 288
-IMG_WIDTH = WIDTH  # 512
-BATCH_SIZE = 10  # Use 16 for grayscale
-TFRECORD_DIR = "./data/tfrecords"
-MODEL_DIR = "models"
-
-def parse_tfrecord(example_proto, grayscale=False):
-    """
-    Parse a single TFRecord example, including the pre-generated heatmap.
-    """
-    feature_description = {
-        "track_id": tf.io.FixedLenFeature([], tf.string),
-        "frame_idx": tf.io.FixedLenFeature([], tf.int64),
-        "image": tf.io.FixedLenFeature([], tf.string),
-        "x": tf.io.FixedLenFeature([], tf.int64),
-        "y": tf.io.FixedLenFeature([], tf.int64),
-        "visibility": tf.io.FixedLenFeature([], tf.int64),
-        "heatmap": tf.io.FixedLenFeature([], tf.string),
-    }
-    example = tf.io.parse_single_example(example_proto, feature_description)
-    frame = tf.image.decode_png(example["image"], channels=1 if grayscale else 3)
-    frame = tf.cast(frame, tf.float32) / 255.0
-    heatmap = tf.image.decode_png(example["heatmap"], channels=1)
-    heatmap = tf.cast(heatmap, tf.float32) / 255.0
-    x = tf.cast(example["x"], tf.float32)
-    y = tf.cast(example["y"], tf.float32)
-    # Ensure visibility is binary (0 or 1) and cast to int32
-    visibility = tf.cast(tf.greater_equal(example["visibility"], 1), tf.int32)
-    logger.debug("Visibility value: %s", visibility)
-    tf.debugging.assert_shapes([(frame, (IMG_HEIGHT, IMG_WIDTH, 1 if grayscale else 3)),
-                               (heatmap, (IMG_HEIGHT, IMG_WIDTH, 1))])
-    return frame, heatmap, example["track_id"], example["frame_idx"]
-
-def load_sequence(track_id, frame_indices, mode, seq, grayscale=False):
-    """
-    Load a sequence of frames and heatmaps from TFRecord using native TensorFlow operations.
-    """
-    logger = logging.getLogger(__name__)
-    dataset = tf.data.TFRecordDataset(os.path.join(TFRECORD_DIR, f"{mode}.tfrecord"))
-    frame_indices = tf.cast(frame_indices, tf.int64)
-
-    dataset = dataset.map(
-        lambda x: parse_tfrecord(x, grayscale), num_parallel_calls=tf.data.AUTOTUNE
-    )
-
-    dataset = dataset.filter(
-        lambda frame, heatmap, tid, fid: tf.logical_and(
-            tf.equal(tid, track_id), tf.reduce_any(tf.equal(fid, frame_indices))
-        )
-    )
-
-    # Count frames to ensure we have enough
-    def count_frames(count, _):
-        return count + 1
-
-    num_frames = dataset.reduce(tf.constant(0, dtype=tf.int64), count_frames)
-    tf.debugging.assert_greater_equal(
-        num_frames,
-        tf.cast(seq, tf.int64),
-        message=f"Track {track_id} has fewer than {seq} frames after filtering"
-    )
-
-    # Take exactly 'seq' frames
-    dataset = dataset.take(seq)
-
-    def reduce_fn(state, element):
-        index, frames, heatmaps = state
-        frame, heatmap, _, _ = element
-        frames = frames.write(index, frame)  # Write frame at index
-        heatmaps = heatmaps.write(index, heatmap)  # Write heatmap at index
-        return index + 1, frames, heatmaps
-
-    frames_acc = tf.TensorArray(dtype=tf.float32, size=seq, dynamic_size=False)
-    heatmaps_acc = tf.TensorArray(dtype=tf.float32, size=seq, dynamic_size=False)
-    initial_state = (tf.constant(0, dtype=tf.int32), frames_acc, heatmaps_acc)
-
-    index, frames, heatmaps = dataset.reduce(initial_state, reduce_fn)
-
-    try:
-        frames = frames.concat()
-        heatmaps = heatmaps.concat()
-        frames = tf.reshape(frames, [seq, IMG_HEIGHT, IMG_WIDTH, 1 if grayscale else 3])
-        heatmaps = tf.reshape(heatmaps, [seq, IMG_HEIGHT, IMG_WIDTH, 1])
-        frames = tf.transpose(frames, [1, 2, 3, 0])  # [H, W, C, seq]
-        heatmaps = tf.transpose(heatmaps, [1, 2, 3, 0])  # [H, W, 1, seq]
-        frames = tf.reshape(frames, [IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)])
-        heatmaps = tf.reshape(heatmaps, [IMG_HEIGHT, IMG_WIDTH, seq])
-        logger.debug(
-            "Loaded sequence for track_id %s, frames shape %s, heatmaps shape %s",
-            track_id,
-            frames.shape,
-            heatmaps.shape
-        )
-        return frames, heatmaps
-    except Exception as e:
-        logger.error("Failed to load sequence for track_id %s: %s", track_id, str(e))
-        raise
-
-def get_tfrecord_sequences(mode, seq):
-    """
-    Returns a list of (track_id, frame_indices) tuples for TFRecord data by parsing the TFRecord file.
-    """
-    logger = logging.getLogger(__name__)
-    sequences = []
-    tfrecord_path = os.path.join(TFRECORD_DIR, f"{mode}.tfrecord")
-
-    if not os.path.exists(tfrecord_path):
-        logger.warning(f"TFRecord file {tfrecord_path} does not exist")
-        return sequences
-
-    # Parse TFRecord to collect track_id and frame_idx
-    dataset = tf.data.TFRecordDataset(tfrecord_path)
-    track_frames = {}
-
-    feature_description = {
-        "track_id": tf.io.FixedLenFeature([], tf.string),
-        "frame_idx": tf.io.FixedLenFeature([], tf.int64),
-    }
-
-    def parse_minimal(example_proto):
-        example = tf.io.parse_single_example(example_proto, feature_description)
-        return example["track_id"], example["frame_idx"]
-
-    try:
-        for record in dataset.map(parse_minimal):
-            track_id, frame_idx = record
-            track_id = track_id.numpy().decode('utf-8')  # Convert to string
-            frame_idx = frame_idx.numpy()  # Convert to int
-            if track_id not in track_frames:
-                track_frames[track_id] = []
-            track_frames[track_id].append(frame_idx)
-
-        # Process each track to generate sequences
-        for track_id, frame_indices in track_frames.items():
-            frame_indices = sorted(frame_indices)  # Ensure frames are sorted
-            num_frames = len(frame_indices)
-            logger.debug("Track %s has %d frames, required %d", track_id, num_frames, seq)
-            if num_frames < seq:
-                logger.warning(
-                    "Track %s has %d frames, need at least %d, skipping",
-                    track_id, num_frames, seq
-                )
-                continue
-            # Generate sequences of 'seq' consecutive frames
-            for t in range(seq - 1, num_frames):
-                seq_indices = frame_indices[t - seq + 1:t + 1]
-                if len(seq_indices) == seq and seq_indices == list(range(seq_indices[0], seq_indices[0] + seq)):
-                    sequences.append((track_id, seq_indices))
-                else:
-                    logger.warning(
-                        "Non-sequential or incomplete frame indices %s for track %s, skipping",
-                        seq_indices, track_id
-                    )
-
-        logger.debug("Found %d valid sequences for mode %s", len(sequences), mode)
-        return sequences
-
-    except Exception as e:
-        logger.error("Error processing TFRecord %s: %s", tfrecord_path, str(e))
-        return sequences
 
 def reshape_tensors(frames, heatmaps, seq, grayscale=False):
     """
@@ -239,114 +70,140 @@ def reshape_tensors(frames, heatmaps, seq, grayscale=False):
         frames, [IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)]
     )
     heatmaps = tf.ensure_shape(heatmaps, [IMG_HEIGHT, IMG_WIDTH, seq])
-    frames = tf.transpose(frames, [2, 0, 1])
-    heatmaps = tf.transpose(heatmaps, [2, 0, 1])
+    frames = tf.transpose(frames, [2, 0, 1])  # (seq*(1 or 3), 288, 512)
+    heatmaps = tf.transpose(heatmaps, [2, 0, 1])  # (seq, 288, 512)
     logger.debug(
         "Reshaped tensors: frames %s, heatmaps %s", frames.shape, heatmaps.shape
     )
     return frames, heatmaps
 
-def main():
-    logger.info("Starting training script")
 
-    parser = argparse.ArgumentParser(description="Train VballNet model.")
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume training from the latest checkpoint.",
+def mixup(frames, heatmaps, alpha=0.5):
+    """
+    Apply mixup augmentation to frames and heatmaps.
+    """
+    logger = logging.getLogger(__name__)
+    batch_size = tf.shape(frames)[0]
+    gamma1 = tf.random.gamma(shape=[batch_size], alpha=alpha)
+    gamma2 = tf.random.gamma(shape=[batch_size], alpha=alpha)
+    lamb = gamma1 / (gamma1 + gamma2)
+    lamb = tf.maximum(lamb, 1.0 - lamb)
+    lamb = tf.reshape(lamb, [batch_size, 1, 1, 1])
+    indices = tf.random.shuffle(tf.range(batch_size))
+    frames_mixed = frames * lamb + tf.gather(frames, indices) * (1.0 - lamb)
+    heatmaps_mixed = heatmaps * lamb + tf.gather(heatmaps, indices) * (1.0 - lamb)
+    logger.debug(
+        "Applied mixup: frames_mixed shape %s, heatmaps_mixed shape %s",
+        frames_mixed.shape,
+        heatmaps_mixed.shape,
     )
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
-    parser.add_argument(
-        "--seq", type=int, default=3, help="Number of frames in sequence."
-    )
-    parser.add_argument(
-        "--grayscale",
-        action="store_true",
-        help="Use grayscale frames with seq input/output channels.",
-    )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="VballNetFastV1",
-        help="Model name to train (VballNetFastV1 or VballNetV1).",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=50,
-        help="Number of epochs to train (default: 50).",
-    )
-    parser.add_argument(
-        "--gpu_memory_limit",
-        type=int,
-        default=-1,
-        help="Limit GPU memory usage in MB, -1 means no limit.",
-    )
+    return frames_mixed, heatmaps_mixed
 
-    args = parser.parse_args()
-    setup_logging(args.debug)
-    logger.info(
-        "Training with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s",
-        args.seq,
-        args.grayscale,
-        args.debug,
-        args.resume,
-        args.model_name,
-    )
 
-    if args.gpu_memory_limit > 0:
-        limit_gpu_memory(args.gpu_memory_limit)
+def augment_sequence(frames, heatmaps, seq, grayscale=False, alpha=-1.0):
+    """
+    Apply data augmentation to frames and heatmaps using TensorFlow.
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        tf.debugging.assert_shapes(
+            [
+                (frames, (seq * (1 if grayscale else 3), 288, 512)),
+                (heatmaps, (seq, 288, 512)),
+            ]
+        )
+        tf.debugging.assert_non_negative(
+            frames, message="Frames contain negative values"
+        )
+        tf.debugging.assert_less_equal(frames, 1.0, message="Frames contain values > 1")
+        tf.debugging.assert_non_negative(
+            heatmaps, message="Heatmaps contain negative values"
+        )
+        tf.debugging.assert_less_equal(
+            heatmaps, 1.0, message="Heatmaps contain values > 1"
+        )
+        logger.debug(
+            "Input shapes: frames %s, heatmaps %s", frames.shape, heatmaps.shape
+        )
+        frames = tf.transpose(frames, [1, 2, 0])
+        heatmaps = tf.transpose(heatmaps, [1, 2, 0])
+        combined = tf.concat([frames, heatmaps], axis=2)
+        combined = tf.image.random_flip_left_right(combined, seed=None)
+        logger.debug("After flip: combined shape %s", combined.shape)
+        frames = combined[:, :, : seq * (1 if grayscale else 3)]
+        heatmaps = combined[:, :, seq * (1 if grayscale else 3) :]
+        frames = tf.transpose(frames, [2, 0, 1])
+        heatmaps = tf.transpose(heatmaps, [2, 0, 1])
+        frames = tf.ensure_shape(frames, [seq * (1 if grayscale else 3), 288, 512])
+        heatmaps = tf.ensure_shape(heatmaps, [seq, 288, 512])
+        logger.debug(
+            "After geometric augmentations: frames %s, heatmaps %s",
+            frames.shape,
+            heatmaps.shape,
+        )
+        return frames, heatmaps
+    except Exception as e:
+        logger.error("Error in augment_sequence: %s", str(e))
+        raise
 
+
+def synchronize_weights(models, shared_weights, process_id, barrier):
+    """
+    Synchronize weights between two models by averaging.
+    """
+    logger = logging.getLogger(__name__)
+    weights = models[process_id].get_weights()
+    shared_weights[process_id] = weights
+    barrier.wait()  # Wait for both processes to save weights
+    if process_id == 0:
+        avg_weights = []
+        for w1, w2 in zip(shared_weights[0], shared_weights[1]):
+            avg_w = (w1 + w2) / 2.0
+            avg_weights.append(avg_w)
+        shared_weights[0] = avg_weights
+        shared_weights[1] = avg_weights
+    barrier.wait()  # Ensure both processes wait until averaging is done
+    models[process_id].set_weights(shared_weights[process_id])
+    logger.info(f"Process {process_id}: Weights synchronized")
+
+
+def train_process(process_id, args, train_pairs, test_pairs, shared_weights, barrier):
+    """
+    Training function for a single process.
+    """
+    logger = setup_logging(args.debug, process_id)
+    limit_gpu_memory(args.gpu_memory_limit)
     if args.seq < 1:
         logger.error("Sequence length must be at least 1, got %d", args.seq)
         raise ValueError(f"Invalid sequence length: {args.seq}")
 
-    if args.model_name not in [
-        "VballNetFastV1",
-        "VballNetV1",
-        "PlayerNetFastV1",
-        "TrackNetV4",
-    ]:
-        logger.error(
-            "Invalid model name: %s. Must be 'VballNetFastV1', 'VballNetV1', 'PlayerNetFastV1', or 'TrackNetV4'",
-            args.model_name,
-        )
-        raise ValueError(f"Invalid model name: {args.model_name}")
-
-    model_name_suffix = (
-        f"_seq{args.seq}_grayscale" if args.grayscale and args.seq == 9 else ""
+    # Split training pairs for this process
+    split_idx = len(train_pairs) // 2
+    if process_id == 0:
+        process_train_pairs = train_pairs[:split_idx]
+    else:
+        process_train_pairs = train_pairs[split_idx:]
+    logger.info(
+        f"Process {process_id}: Number of training pairs: %d", len(process_train_pairs)
     )
-    model_save_name = f"{args.model_name}{model_name_suffix}"
-    model_save_dir = os.path.join(MODEL_DIR, model_save_name)
-    os.makedirs(model_save_dir, exist_ok=True)
-    os.makedirs(TFRECORD_DIR, exist_ok=True)
-    logger.info("Created model save directory: %s", model_save_dir)
 
-    train_sequences = get_tfrecord_sequences("train", args.seq)
-    test_sequences = get_tfrecord_sequences("test", args.seq)
-
-    logger.info("Number of training sequences: %d", len(train_sequences))
-    logger.info("Number of test sequences: %d", len(test_sequences))
-    if len(train_sequences) == 0:
-        logger.error(
-            "No training data found. Check TFRECORD_DIR/train.tfrecord."
-        )
-        raise ValueError(
-            "No training data found. Check TFRECORD_DIR/train.tfrecord."
-        )
-    if len(test_sequences) == 0:
-        logger.warning("No test data found. Check TFRECORD_DIR/test.tfrecord.")
-
+    # Create datasets
     train_dataset = (
         tf.data.Dataset.from_tensor_slices(
             (
-                [p[0] for p in train_sequences],  # track_id
-                [p[1] for p in train_sequences],  # frame_indices
+                [p[0] for p in process_train_pairs],
+                [p[1] for p in process_train_pairs],
+                [p[2] for p in process_train_pairs],
             )
         )
-        .shuffle(10)
         .map(
-            lambda t, f: load_sequence(t, f, "train", args.seq, args.grayscale),
+            lambda t, c, f: tf.py_function(
+                func=lambda x, y, z: load_data(
+                    x, y, z, "train", args.seq, args.grayscale
+                ),
+                inp=[t, c, f],
+                Tout=[tf.float32, tf.float32],
+            ),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
         .map(
@@ -355,19 +212,39 @@ def main():
             ),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
+        .map(
+            lambda frames, heatmaps: augment_sequence(
+                frames, heatmaps, args.seq, args.grayscale, args.alpha
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
         .batch(BATCH_SIZE)
-        .prefetch(tf.data.AUTOTUNE)
     )
+
+    if args.alpha > 0:
+        train_dataset = train_dataset.map(
+            lambda frames, heatmaps: mixup(frames, heatmaps, args.alpha),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+
+    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
 
     test_dataset = (
         tf.data.Dataset.from_tensor_slices(
             (
-                [p[0] for p in test_sequences],  # track_id
-                [p[1] for p in test_sequences],  # frame_indices
+                [p[0] for p in test_pairs],
+                [p[1] for p in test_pairs],
+                [p[2] for p in test_pairs],
             )
         )
         .map(
-            lambda t, f: load_sequence(t, f, "test", args.seq, args.grayscale),
+            lambda t, c, f: tf.py_function(
+                func=lambda x, y, z: load_data(
+                    x, y, z, "test", args.seq, args.grayscale
+                ),
+                inp=[t, c, f],
+                Tout=[tf.float32, tf.float32],
+            ),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
         .map(
@@ -381,10 +258,9 @@ def main():
     )
 
     train_size = tf.data.experimental.cardinality(train_dataset).numpy()
-    test_size = tf.data.experimental.cardinality(test_dataset).numpy()
-    logger.info("Number of training batches: %d", train_size)
-    logger.info("Number of test batches: %d", test_size)
+    logger.info(f"Process {process_id}: Number of training batches: %d", train_size)
 
+    # Initialize model
     model = get_model(
         args.model_name,
         height=IMG_HEIGHT,
@@ -392,27 +268,22 @@ def main():
         seq=args.seq,
         grayscale=args.grayscale,
     )
-    logger.info(f"Model input shape: {model.input_shape}")
-    logger.info(f"Model output shape: {model.output_shape}")
-    model.summary(print_fn=lambda x: logger.info(x))
+    models = {process_id: model}  # Store model for this process
 
-    for frames, heatmaps in train_dataset.take(1):
-        logger.info(
-            f"Train dataset sample - Frames shape: {frames.shape}, Heatmaps shape: {heatmaps.shape}"
-        )
-    for frames, heatmaps in test_dataset.take(1):
-        logger.info(
-            f"Test dataset sample - Frames shape: {frames.shape}, Heatmaps shape: {heatmaps.shape}"
-        )
+    # Load checkpoint if resuming
+    model_name_suffix = f"_seq{args.seq}_grayscale" if args.grayscale else ""
+    model_save_name = f"{args.model_name}{model_name_suffix}"
+    model_save_dir = os.path.join(MODEL_DIR, model_save_name)
+    os.makedirs(model_save_dir, exist_ok=True)
 
     initial_epoch = 0
     if args.resume:
         checkpoint_files = glob.glob(
-            os.path.join(model_save_dir, f"{model_save_name}/{model_save_name}_*.keras")
+            os.path.join(model_save_dir, f"{model_save_name}_*.keras")
         )
         if checkpoint_files:
             latest_checkpoint = max(checkpoint_files, key=os.path.getmtime)
-            logger.info("Resuming training from %s", latest_checkpoint)
+            logger.info(f"Process {process_id}: Resuming from %s", latest_checkpoint)
             model = tf.keras.models.load_model(
                 latest_checkpoint, custom_objects={"custom_loss": custom_loss}
             )
@@ -422,81 +293,127 @@ def main():
             initial_epoch = int(epoch_str) if epoch_str.isdigit() else 0
         else:
             logger.warning(
-                "No checkpoints found for %s in %s, starting training from scratch.",
-                model_save_name,
-                model_save_dir,
+                f"Process {process_id}: No checkpoints found, starting from scratch."
             )
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+    # Compile model
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1e-3, decay_steps=train_size * 2, decay_rate=0.9
+    )
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     model.compile(optimizer=optimizer, loss=custom_loss, metrics=["mae"])
-    logger.info(
-        "Model compiled with optimizer=Adam(learning_rate=1e-3), loss=custom_loss, metrics=['mae']"
-    )
+    logger.info(f"Process {process_id}: Model compiled with Adam, custom_loss, mae")
 
+    # Callbacks
     filepath = os.path.join(
-        model_save_dir, f"{model_save_name}/{model_save_name}_{{epoch:02d}}.keras"
+        model_save_dir, f"{model_save_name}_{process_id}_{{epoch:02d}}.keras"
     )
-
-    class LearningRateLogger(tf.keras.callbacks.Callback):
-        def __init__(self):
-            super().__init__()
-
-        def on_epoch_begin(self, epoch, logs=None):
-            current_lr = self.model.optimizer.learning_rate.numpy()
-            logger.info(f"Epoch {epoch + 1}: Learning rate = {current_lr}")
-
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
             filepath=filepath, save_best_only=False, monitor="val_loss"
         ),
         tf.keras.callbacks.TensorBoard(
-            log_dir=os.path.join(MODEL_DIR, "logs", model_save_name)
+            log_dir=os.path.join(
+                MODEL_DIR, "logs", f"{model_save_name}_process_{process_id}"
+            )
         ),
         tf.keras.callbacks.EarlyStopping(patience=30, monitor="val_loss"),
-        LearningRateLogger(),
     ]
 
-    logger.info(
-        "Callbacks configured: ModelCheckpoint, TensorBoard, EarlyStopping, LearningRateLogger"
-    )
-
-    tf.profiler.experimental.start(
-        os.path.join(MODEL_DIR, "logs", model_save_name, "profiler")
-    )
-
-    for frames, heatmaps in train_dataset.take(1):
-        logger.info("Frames shape: %s", frames.shape)
-        logger.info("Heatmaps shape: %s", heatmaps.shape)
-        frames = tf.transpose(frames[0], [1, 2, 0])
-        heatmaps = tf.transpose(heatmaps[0], [1, 2, 0])
-        if args.grayscale:
-            tf.io.write_file(
-                "augmented_frame.png",
-                tf.image.encode_png(
-                    tf.cast(tf.image.grayscale_to_rgb(frames[:, :, :1]) * 255, tf.uint8)
-                ),
-            )
-        else:
-            tf.io.write_file(
-                "augmented_frame.png",
-                tf.image.encode_png(tf.cast(frames[:, :, :3] * 255, tf.uint8)),
-            )
-        tf.io.write_file(
-            "augmented_heatmap.png",
-            tf.image.encode_png(tf.cast(heatmaps[:, :, 0:1] * 255, tf.uint8)),
+    # Training loop with synchronization
+    for epoch in range(initial_epoch, args.epochs):
+        logger.info(f"Process {process_id}: Starting epoch {epoch + 1}")
+        model.fit(
+            train_dataset,
+            validation_data=test_dataset,
+            epochs=1,
+            initial_epoch=0,
+            callbacks=callbacks,
+            verbose=1 if process_id == 0 else 0,
         )
+        logger.info(f"Process {process_id}: Epoch {epoch + 1} completed")
+        synchronize_weights(models, shared_weights, process_id, barrier)
 
-    logger.info("Starting training...")
-    model.fit(
-        train_dataset,
-        validation_data=test_dataset,
-        epochs=args.epochs,
-        initial_epoch=initial_epoch,
-        callbacks=callbacks,
+    logger.info(f"Process {process_id}: Training completed")
+
+
+def main():
+    logger = setup_logging()
+    parser = argparse.ArgumentParser(
+        description="Train VballNet model with parallel processes."
     )
-    logger.info("Training completed")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the latest checkpoint.",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument(
+        "--seq", type=int, default=9, help="Number of frames in sequence."
+    )
+    parser.add_argument(
+        "--grayscale", action="store_true", help="Use grayscale frames."
+    )
+    parser.add_argument(
+        "--model_name", type=str, default="VballNetV1", help="Model name to train."
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=50, help="Number of epochs to train."
+    )
+    parser.add_argument(
+        "--alpha", type=float, default=-1.0, help="Alpha for mixup augmentation."
+    )
+    parser.add_argument(
+        "--gpu_memory_limit", type=int, default=-1, help="Limit GPU memory usage in MB."
+    )
+    args = parser.parse_args()
 
-    tf.profiler.experimental.stop()
+    logger.info(
+        "Starting parallel training with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s, gpu_memory_limit=%d",
+        args.seq,
+        args.grayscale,
+        args.debug,
+        args.resume,
+        args.model_name,
+        args.alpha,
+        args.gpu_memory_limit,
+    )
+
+    if args.model_name not in ["VballNetV1"]:
+        logger.error("Invalid model name: %s. Must be 'VballNetV1'", args.model_name)
+        raise ValueError(f"Invalid model name: {args.model_name}")
+
+    # Load data
+    train_pairs = get_video_and_csv_pairs("train", args.seq)
+    test_pairs = get_video_and_csv_pairs("test", args.seq)
+    logger.info("Total training pairs: %d", len(train_pairs))
+    logger.info("Total test pairs: %d", len(test_pairs))
+
+    if len(train_pairs) == 0:
+        logger.error("No training data found.")
+        raise ValueError("No training data found.")
+
+    # Initialize multiprocessing
+    manager = Manager()
+    shared_weights = manager.dict()
+    barrier = Barrier(2)  # Barrier for 2 processes
+    processes = []
+
+    # Start two processes
+    for process_id in range(2):
+        p = mp.Process(
+            target=train_process,
+            args=(process_id, args, train_pairs, test_pairs, shared_weights, barrier),
+        )
+        processes.append(p)
+        p.start()
+
+    # Wait for processes to complete
+    for p in processes:
+        p.join()
+
+    logger.info("Parallel training completed")
+
 
 if __name__ == "__main__":
     main()
