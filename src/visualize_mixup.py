@@ -4,8 +4,8 @@ import numpy as np
 import os
 import logging
 from datetime import datetime
-from utils import get_video_and_csv_pairs
-
+from utils import get_video_and_csv_pairs, load_data
+from train_v1 import reshape_tensors, augment_sequence, parser_args
 
 # Настройка логирования
 def setup_logging(debug=False):
@@ -142,9 +142,53 @@ if __name__ == "__main__":
     SEQ = 3
     GRAYSCALE = False
     ALPHA = 0.5
+    BATCH_SIZE = 8
     SAVE_DIR = "mixup_visualizations"
 
     # Загружаем датасет (пример, нужно заменить на реальный train_dataset)
     # Здесь предполагается, что train_dataset уже создан, как в main()
     # Для демонстрации можно использовать заглушку или реальный датасет
-    visualize_mixup(train_dataset, SEQ, GRAYSCALE, ALPHA, SAVE_DIR)
+
+    args = parser_args()
+
+    train_pairs = get_video_and_csv_pairs("train", args.seq)
+
+
+    
+
+
+    train_dataset = (
+        tf.data.Dataset.from_tensor_slices(
+            (
+                [p[0] for p in train_pairs],
+                [p[1] for p in train_pairs],
+                [p[2] for p in train_pairs],
+            )
+        )
+        .map(
+            lambda t, c, f: tf.py_function(
+                func=lambda x, y, z: load_data(
+                    x, y, z, "train", args.seq, args.grayscale
+                ),
+                inp=[t, c, f],
+                Tout=[tf.float32, tf.float32],
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+        .map(
+            lambda frames, heatmaps: reshape_tensors(
+                frames, heatmaps, args.seq, args.grayscale
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+        .map(
+            lambda frames, heatmaps: augment_sequence(
+                frames, heatmaps, args.seq, args.grayscale, args.alpha
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+        .batch(BATCH_SIZE)
+    )
+
+
+    visualize_mixup(train_dataset, args.seq, args.grayscale , args.alpha, SAVE_DIR)
