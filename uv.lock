@@ -1335,6 +1335,21 @@ wheels = [
 ]
 
 [[package]]
+name = "pykalman"
+version = "0.10.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "scikit-base" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2f/17/7d43c93b06dec3070f9c38c594dfc10eb87978b86169bd5769cc034f2dc7/pykalman-0.10.1.tar.gz", hash = "sha256:c3019211d6551f6a84e9f08d3a6d11d5ace95d544e361b9cecc633041f74c139", size = 240708 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/81/eb/c38ec36ec30206974e572162623890ba4770fb0c29b96a82eaebeb97ce03/pykalman-0.10.1-py2.py3-none-any.whl", hash = "sha256:769a531bfd8dd0c4de562794648220f5523567ef6bb7fac09daf1acdfa205b55", size = 248515 },
+]
+
+[[package]]
 name = "pyparsing"
 version = "3.1.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1459,6 +1474,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/aa/65/7d973b89c4d2351d7fb232c2e452547ddfa243e93131e7cfa766da627b52/rsa-4.9.tar.gz", hash = "sha256:e38464a49c6c85d7f1351b0126661487a7e0a14a50f1675ec50eb34d4f20ef21", size = 29711 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/97/fa78e3d2f65c02c8e1268b9aba606569fe97f6c8f7c2d74394553347c145/rsa-4.9-py3-none-any.whl", hash = "sha256:90260d9058e514786967344d0ef75fa8727eed8a7d2e43ce9f4bcf1b536174f7", size = 34315 },
+]
+
+[[package]]
+name = "scikit-base"
+version = "0.12.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/56/08241a3da51aa65db33e8cbdaff8bf686400b4038e5ec15f9cac9fe66a4c/scikit_base-0.12.3.tar.gz", hash = "sha256:082e9933924679e892d6c02314c4b0d8cff3ccce1755957756421da5590ee833", size = 122244 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f4/05/935427ff03dbfb5e3a5ad10b063c90e510708ff273de934cbbc1e5ad4e9c/scikit_base-0.12.3-py3-none-any.whl", hash = "sha256:72324750412906bd3e08a729f60ce1925735e7bb2d54653ad9706038b6d26621", size = 145486 },
 ]
 
 [[package]]
@@ -1939,6 +1963,7 @@ dependencies = [
     { name = "psutil" },
     { name = "pyasn1" },
     { name = "pyasn1-modules" },
+    { name = "pykalman" },
     { name = "pyparsing" },
     { name = "requests" },
     { name = "requests-oauthlib" },
@@ -2017,6 +2042,7 @@ requires-dist = [
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "pyasn1", specifier = "==0.6.0" },
     { name = "pyasn1-modules", specifier = "==0.4.0" },
+    { name = "pykalman", specifier = ">=0.10.1" },
     { name = "pyparsing", specifier = "==3.1.4" },
     { name = "requests", specifier = "==2.32.3" },
     { name = "requests-oauthlib", specifier = "==2.0.0" },
