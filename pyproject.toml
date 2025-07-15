@@ -56,6 +56,7 @@ dependencies = [
     "psutil>=7.0.0",
     "pyasn1==0.6.0",
     "pyasn1-modules==0.4.0",
+    "pykalman>=0.10.1",
     "pyparsing==3.1.4",
     "pyqt6>=6.9.1",
     "requests==2.32.3",
