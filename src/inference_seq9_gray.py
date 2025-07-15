@@ -203,6 +203,14 @@ def main():
     out_dim = 9 if "seq9_grayscale" in args.model_path else 3
 
 
+    # Загрузка InpaintNet, если требуется фильтрация
+    inpaintnet_model = None
+    inpaintnet_path = os.path.join(os.path.dirname(args.model_path), "inpaintnet_trained.keras")
+    #inpaintnet_path = 'inpaintnet_trained.keras'
+    if os.path.exists(inpaintnet_path):
+        inpaintnet_model = tf.keras.models.load_model(inpaintnet_path)
+        print(f"Loaded InpaintNet from {inpaintnet_path}")
+
     pbar = tqdm(total=total_frames, desc="Processing video", unit="frame")
 
     while cap.isOpened():
@@ -233,6 +241,31 @@ def main():
                 input_width=input_width,
                 out_dim=out_dim,
             )
+            # predictions: list of (visibility, x, y) for out_dim frames
+
+            # --- Фильтрация через InpaintNet ---
+            if inpaintnet_model is not None:
+                # Подготовка входа: берем последние seq_len=9 точек (или меньше, если out_dim < 9)
+                seq_len = len(predictions)
+                coords = np.array([[x, y] for (_, x, y) in predictions], dtype=np.float32)  # (seq_len, 2)
+                mask = np.array([[v] for (v, _, _) in predictions], dtype=np.float32)       # (seq_len, 1)
+                coords = coords[np.newaxis, ...]  # (1, seq_len, 2)
+                mask = mask[np.newaxis, ...]      # (1, seq_len, 1)
+                # Нормализация координат
+                coords_norm = coords.copy()
+                coords_norm[..., 0] /= input_width
+                coords_norm[..., 1] /= input_height
+                # Прогон через модель
+                filtered_coords = inpaintnet_model.predict([coords_norm, mask])
+                # Де-нормализация
+                filtered_coords[..., 0] *= input_width
+                filtered_coords[..., 1] *= input_height
+                # Обновляем predictions координатами после фильтрации
+                predictions = [
+                    (int(mask[0, i, 0]), int(filtered_coords[0, i, 0]), int(filtered_coords[0, i, 1]))
+                    for i in range(seq_len)
+                ]
+
             # Выбираем предсказание для последнего кадра
             print(f"Frame {frame_index}: Predictions: {predictions}")
             visibility, x, y = predictions[-1]

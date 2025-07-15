@@ -53,6 +53,7 @@ def load_image_frames(
             logger.error("Frame not found at %s", frame_path)
             raise FileNotFoundError(f"Frame not found: {frame_path}")
         try:
+            #print(frame_path)
             image_string = tf.io.read_file(frame_path)
             frame = tf.image.decode_jpeg(image_string, channels=1 if grayscale else 3)
         except Exception as e:

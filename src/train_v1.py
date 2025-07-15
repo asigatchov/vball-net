@@ -187,11 +187,7 @@ def augment_sequence(frames, heatmaps, seq, grayscale=False, alpha=-1.0):
         )
         raise
 
-
-def main():
-
-
-    logger = logging.getLogger(__name__)
+def parser_args():
 
     parser = argparse.ArgumentParser(description="Train VballNet model.")
     parser.add_argument(
@@ -234,7 +230,13 @@ def main():
         help="Limit GPU memory usage in MB, -1 means no limit.",
     )
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+
+    args = parser_args()
+    logger = logging.getLogger(__name__)
 
     logger.info(
         "Starting training script with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s gpu_memory_limit=%d",
@@ -248,6 +250,7 @@ def main():
     )
 
 
+    
     limit_gpu_memory(args.gpu_memory_limit)
     if args.seq < 1:
         logger.error("Sequence length must be at least 1, got %d", args.seq)
