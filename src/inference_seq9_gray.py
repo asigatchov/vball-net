@@ -9,6 +9,8 @@ import time
 from tqdm import tqdm
 from model.VballNetFastV1 import VballNetFastV1
 from model.TrackNetV4 import TrackNetV4
+from model.InpaintNet import InpaintNet
+
 
 from utils import custom_loss
 
@@ -180,6 +182,78 @@ def draw_track(
     return frame
 
 
+def load_inpaint_model(model_path):
+    """Загружает модель InpaintNet для фильтрации и предсказания пропущенных мячей"""
+    if not os.path.exists(model_path):
+        print(f"InpaintNet model not found at {model_path}, skipping filtering")
+        return None
+    
+    try:
+        # Создаем модель
+        model = InpaintNet()
+        
+        # Компилируем модель (нужно для загрузки весов)
+        model.compile(optimizer='adam', loss='mse')
+        
+        # Создаем фиктивные входные данные для построения графа модели
+        dummy_coords = np.zeros((1, 16, 2), dtype=np.float32)
+        dummy_mask = np.zeros((1, 16, 1), dtype=np.float32)
+        _ = model([dummy_coords, dummy_mask])
+        
+        # Загружаем веса
+        model.load_weights(model_path)
+        print(f"Successfully loaded InpaintNet from {model_path}")
+        return model
+    except Exception as e:
+        print(f"Error loading InpaintNet model: {e}")
+        return None
+
+def filter_with_inpaintnet(inpaintnet_model, predictions, input_width, input_height, window_size=16):
+    if not hasattr(filter_with_inpaintnet, "pred_buffer"):
+        filter_with_inpaintnet.pred_buffer = deque(maxlen=window_size)
+
+    # Добавляем новые предсказания
+    for pred in predictions:
+        filter_with_inpaintnet.pred_buffer.append(pred)
+
+    # Заполняем буфер, если он не полон
+    while len(filter_with_inpaintnet.pred_buffer) < window_size:
+        filter_with_inpaintnet.pred_buffer.append((0, 0, 0))
+
+    # Подготовка данных
+    coords = np.array([[x/input_width, y/input_height] for (_, x, y) in filter_with_inpaintnet.pred_buffer], 
+                     dtype=np.float32)
+    mask = np.array([[v] for (v, _, _) in filter_with_inpaintnet.pred_buffer], 
+                   dtype=np.float32)
+
+    print(f"Input coords: {coords}")
+    print(f"Input mask: {mask}")
+
+    coords = coords[np.newaxis, ...]
+    mask = mask[np.newaxis, ...]
+
+    # Предсказание
+    filtered_coords = inpaintnet_model.predict([coords, mask], verbose=0)
+
+    # Денормализация
+    filtered_coords[..., 0] *= input_width
+    filtered_coords[..., 1] *= input_height
+
+    print(f"Filtered coords: {filtered_coords}")
+
+    # Формируем результат
+    filtered_predictions = []
+    idx = window_size - 1  # Берем последнее предсказание
+    for i in range(len(predictions)):
+        visibility = predictions[i][0]
+        x = int(filtered_coords[0, idx, 0])
+        y = int(filtered_coords[0, idx, 1])
+        if visibility == 0 and 0 <= x < input_width and 0 <= y < input_height:
+            visibility = 1
+        filtered_predictions.append((visibility, x, y))
+
+    return filtered_predictions
+
 def main():
     args = parse_args()
     input_width, input_height = 512, 288
@@ -205,7 +279,7 @@ def main():
 
     # Загрузка InpaintNet, если требуется фильтрация
     inpaintnet_model = None
-    inpaintnet_path = os.path.join(os.path.dirname(args.model_path), "inpaintnet_trained.keras")
+    inpaintnet_path = "checkpoints/inpaintnet_200.keras"
     #inpaintnet_path = 'inpaintnet_trained.keras'
     if os.path.exists(inpaintnet_path):
         inpaintnet_model = tf.keras.models.load_model(inpaintnet_path)
@@ -230,7 +304,6 @@ def main():
         if len(frame_buffer) == 9:
             input_tensor = np.stack(frame_buffer, axis=2)  # (height, width, 9)
             input_tensor = np.expand_dims(input_tensor, axis=0)  # (1, height, width, 9)
-            # Транспонирование для получения (1, 9, height, width)
             input_tensor = np.transpose(input_tensor, (0, 3, 1, 2))  # (1, 9, 288, 512)
 
             output = model.predict(input_tensor, verbose=0)
@@ -243,28 +316,26 @@ def main():
             )
             # predictions: list of (visibility, x, y) for out_dim frames
 
-            # --- Фильтрация через InpaintNet ---
+            # --- Фильтрация через InpaintNet только после накопления 16 кадров ---
             if inpaintnet_model is not None:
-                # Подготовка входа: берем последние seq_len=9 точек (или меньше, если out_dim < 9)
-                seq_len = len(predictions)
-                coords = np.array([[x, y] for (_, x, y) in predictions], dtype=np.float32)  # (seq_len, 2)
-                mask = np.array([[v] for (v, _, _) in predictions], dtype=np.float32)       # (seq_len, 1)
-                coords = coords[np.newaxis, ...]  # (1, seq_len, 2)
-                mask = mask[np.newaxis, ...]      # (1, seq_len, 1)
-                # Нормализация координат
-                coords_norm = coords.copy()
-                coords_norm[..., 0] /= input_width
-                coords_norm[..., 1] /= input_height
-                # Прогон через модель
-                filtered_coords = inpaintnet_model.predict([coords_norm, mask])
-                # Де-нормализация
-                filtered_coords[..., 0] *= input_width
-                filtered_coords[..., 1] *= input_height
-                # Обновляем predictions координатами после фильтрации
-                predictions = [
-                    (int(mask[0, i, 0]), int(filtered_coords[0, i, 0]), int(filtered_coords[0, i, 1]))
-                    for i in range(seq_len)
-                ]
+                # Инициализация буфера для фильтрации
+                if not hasattr(main, "filter_buffer"):
+                    main.filter_buffer = deque(maxlen=16)
+                # Добавляем новые предсказания в буфер
+                for pred in predictions:
+                    main.filter_buffer.append(pred)
+                # Применяем фильтр только если буфер заполнен
+                if len(main.filter_buffer) == 16:
+                    predictions = filter_with_inpaintnet(
+                        inpaintnet_model,
+                        list(main.filter_buffer),
+                        input_width,
+                        input_height,
+                        window_size=16
+                    )
+                else:
+                    # Если буфер не заполнен, используем исходные predictions
+                    predictions = list(main.filter_buffer)[-len(predictions):]
 
             # Выбираем предсказание для последнего кадра
             print(f"Frame {frame_index}: Predictions: {predictions}")
@@ -291,9 +362,10 @@ def main():
                 vis_frame = frame.copy()
                 vis_frame = draw_track(vis_frame, track_points)
                 if args.visualize:
-                    # visualize_heatmaps(
-                    #     output, frame_index, input_height, input_width, out_dim=out_dim
-                    # )
+                    # Отрисовка всех предсказанных точек на одном кадре
+                    for i, (visibility, x, y) in enumerate(predictions):
+                        if visibility == 1:
+                            cv2.circle(vis_frame, (int(x * frame_width / input_width), int(y * frame_height / input_height)), 5, (0, 255, 0), -1)
                     cv2.namedWindow("Ball Tracking", cv2.WINDOW_NORMAL)
                     cv2.imshow("Ball Tracking", vis_frame)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
