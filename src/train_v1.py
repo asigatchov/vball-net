@@ -63,6 +63,11 @@ def get_model(model_name, height, width, seq, grayscale=False):
         return TrackNetV4(height, width, 'TypeB')
 
     print(f"Creating model {model_name} with height={height}, width={width}, in_dim={in_dim}, out_dim={out_dim}, seq={seq}, grayscale={grayscale}")
+    
+    if model_name == 'VballNetV2':
+        from model.VballNetV2 import VballNetV2
+        return VballNetV2(height, width, in_dim=in_dim, out_dim=out_dim)
+
     return VballNetV1(height, width, in_dim=in_dim, out_dim=out_dim)
 
 def reshape_tensors(frames, heatmaps, seq, grayscale=False):
@@ -256,7 +261,7 @@ def main():
         logger.error("Sequence length must be at least 1, got %d", args.seq)
         raise ValueError(f"Invalid sequence length: {args.seq}")
 
-    if args.model_name not in ["VballNetFastV1", "VballNetV1", "PlayerNetFastV1", "TrackNetV4"]:
+    if args.model_name not in ["VballNetFastV1", "VballNetV1",'VballNetV2', "PlayerNetFastV1", "TrackNetV4"]:
         logger.error(
             "Invalid model name: %s. Must be 'VballNetFastV1' or 'VballNetV1'",
             args.model_name,
