@@ -61,6 +61,12 @@ Run inference with a pre-trained model using the following command:
 uv run src/inference_onnx.py --video_path volleyball-backline-video.mp4 --model_path vb-models/VballNetFastV1_155_h288_w512.onnx --output_dir ./predicts/
 ```
 
+
+
+## Frame-by-Frame Annotation
+To create or edit annotations for training or evaluating VballNet models, use the `imgLabel.py` script. This script allows frame-by-frame annotation of video files to mark object positions (e.g., a volleyball). Annotations are saved as CSV files in the `csv/` directory, with filenames derived from the input video (e.g., `video.mp4` saves to `csv/video.csv`). For detailed instructions on using the annotation script, refer to the [Annotation Guide](docs/imgLabel.md).
+
+
 ## Key Features
 - **Based on TrackNetV4**: Inherits the robust motion tracking capabilities of TrackNetV4, tailored specifically for volleyball detection.
 - **Optimized Network Architectures**:

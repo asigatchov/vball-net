@@ -520,23 +520,74 @@ def get_model(model_name, height, width):
     return VballNetV1(height, width, in_dim=9, out_dim=3)
 
 
-#     """
-#     if model_name == "Baseline_TrackNetV2":
-#         return TrackNetV2(height, width)
-#     elif model_name == "TrackNetV4_TypeA":
-#         return TrackNetV4(height, width, "TypeA")
-#     elif model_name == "TrackNetV4_TypeB":
-#         return TrackNetV4(height, width, "TypeB")
-#     elif model_name == "TrackNetV4_Nano":
-#         from models.TrackNetV4Nano import TrackNetV4Nano
-#         return TrackNetV4Nano(height, width, fusion_layer_type="TypeA")
-#     elif model_name == "TrackNetV4_Small":
-#         from models.TrackNetV4Small import TrackNetV4Small
-#         return TrackNetV4Small(height, width, fusion_layer_type="TypeA")
-#     elif model_name == "TrackNetV4_Fast":
-#         from models.TrackNetV4Fast import TrackNetV4Fast
-#         return TrackNetV4Fast(height, width)
+def save_info(info, video_path):
+    success = False
+    video_name = 'csv/' + os.path.split(video_path)[-1][:-4]
+    csv_path = video_name+'_ball.csv'
+    try:
+        with open(csv_path, 'w') as file:
+            file.write("Frame,Visibility,X,Y\n")
+            for frame in info:
+                data = "{},{},{:.3f},{:.3f}".format(info[frame]["Frame"], info[frame]["Visibility"],
+                                            info[frame]["X"],info[frame]["Y"])
+                file.write(data+'\n')
+        success = True
+        print("Save info successfully into", video_name+'_ball.csv')
+    except:
+        print("Save info failure ", csv_path)
+
+    return success
+
+def load_info(csv_path):
+    with open(csv_path, 'r') as file:
+        lines = file.readlines()
+        n_frames = len(lines) - 1
+        info = {
+            idx:{
+            'Frame': idx,
+            'Visibility': 0,
+            'x': -1,
+            'y': -1
+            } for idx in range(n_frames)
+        }
+
+        for line in lines[1:]:
+            frame, Visibility, x, y = line.split(',')[0:4]
+            frame = int(frame)
+
+            if info.get(frame) is None:
+                print("Frame {} not found in info, creating new entry.".format(frame))
+                info[frame] = {
+                    'Frame': frame,
+                    'Visibility': 0,
+                    'X': -1,
+                    'Y': -1
+                }
 
 
-#     else:
-#         raise ValueError("Unknown model name")
+            info[frame]['Frame'] = frame
+            info[frame]['Visibility'] = int(Visibility)
+            info[frame]['X'] = float(x)
+            info[frame]['Y'] = float(y)
+
+    return info
+
+def show_image(image, frame_no, x, y):
+    h, w, _ = image.shape
+    if x != -1 and y != -1:
+        x_pos = int(x)
+        y_pos = int(y)
+        cv2.circle(image, (x_pos, y_pos), 5, (0, 0, 255), -1)
+    text = "Frame: {}".format(frame_no)
+    cv2.putText(image, text, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 3, cv2.LINE_AA)
+    return image
+
+def go2frame(cap, frame_no, info):
+    x,y = -1, -1
+    if frame_no in info:
+        x, y = info[frame_no]['X'], info[frame_no]['Y']
+
+    cap.set(1, frame_no)
+    ret, image = cap.read()
+    image = show_image(image, frame_no, x, y)
+    return image
