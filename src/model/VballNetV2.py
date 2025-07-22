@@ -9,7 +9,9 @@ from tensorflow.keras.layers import (
     UpSampling2D,
     concatenate,
     Reshape,
-    Layer,
+    Layer, 
+            Lambda,  # Добавьте Lambda
+
 )
 from tensorflow.keras.models import Model
 
@@ -33,7 +35,7 @@ def power_normalization(input, a, b):
         1
         + tf.exp(
             -(5 / (0.45 * tf.abs(tf.tanh(a)) + 1e-1))
-            * (tf.abs(input) - 0.6 * tf.tanh(b))
+            * (tf.abs(input) - 0.8 * tf.tanh(b))
         )
     )
 
@@ -130,45 +132,45 @@ class FusionLayerTypeA(Layer):
             )  # Use attention map of current frame
         return tf.stack(outputs, axis=1)
 
+from tensorflow import keras
+import tensorflow as tf
+def spatial_attention(x):
+    # x имеет форму (None, channels, height, width), например (None, 128, 72, 128)
+    
+    # Переключаемся на channels_last: (None, height, width, channels)
+    x = keras.layers.Permute((2, 3, 1))(x)  # (None, 72, 128, 128)
+    
+    # Вычисляем среднее и максимум по пространственным осям
+    avg_pool = keras.layers.GlobalAveragePooling2D(data_format='channels_last')(x)  # (None, channels)
+    max_pool = keras.layers.GlobalMaxPooling2D(data_format='channels_last')(x)    # (None, channels)
+    
+    # Добавляем единичные размерности
+    avg_pool = keras.layers.Reshape((1, 1, x.shape[-1]))(avg_pool)  # (None, 1, 1, channels)
+    max_pool = keras.layers.Reshape((1, 1, x.shape[-1]))(max_pool)  # (None, 1, 1, channels)
+    
+    # Конкатенируем по канальной оси (axis=-1 в channels_last)
+    concat = keras.layers.Concatenate(axis=-1)([avg_pool, max_pool])  # (None, 1, 1, 2*channels)
+    
+    # Восстанавливаем пространственные размерности
+    concat = keras.layers.UpSampling2D(
+        size=(x.shape[1], x.shape[2]), data_format='channels_last'
+    )(concat)  # (None, 72, 128, 2*channels)
+    
+    # Применяем свертку
+    attention = keras.layers.Conv2D(
+        1, (7, 7), padding='same', activation='sigmoid', data_format='channels_last'
+    )(concat)  # (None, 72, 128, 1)
+    
+    # Умножаем на входной тензор
+    output = x * attention  # (None, 72, 128, channels)
+    
+    # Возвращаемся к channels_first: (None, channels, height, width)
+    output = keras.layers.Permute((3, 1, 2))(output)  # (None, 128, 72, 128)
+    
+    return output
 
-# FusionLayerTypeB
-class FusionLayerTypeB(Layer):
-    """
-    A Keras layer that incorporates motion using attention maps - version 2.
-    Applies attention map of current frame t to feature map of frame t.
-    """
-
-    def __init__(self, num_frames, out_dim, **kwargs):
-        super(FusionLayerTypeB, self).__init__(**kwargs)
-        self.num_frames = num_frames
-        self.out_dim = out_dim
-
-    def call(self, inputs):
-        feature_map, attention_map = inputs
-        outputs = []
-        for t in range(min(self.num_frames, self.out_dim)):
-            outputs.append(
-                feature_map[:, t, :, :] * attention_map[:, t, :, :]
-            )  # Use attention map of current frame
-        return tf.stack(outputs, axis=1)
-
-
-def VballNetV1(height, width, in_dim, out_dim, fusion_layer_type="TypeA"):
-    """
-    Constructs the VballNetV1 model for volleyball tracking.
-    Supports Grayscale (N input frames, N output heatmaps) and RGB (N×3 input channels, N output heatmaps) modes.
-
-    Args:
-        height (int): Height of the input frames in pixels.
-        width (int): Width of the input frames in pixels.
-        in_dim (int): Number of input channels (N for grayscale, N×3 for RGB).
-        out_dim (int): Number of output channels (N for both modes).
-        fusion_layer_type (str, optional): Type of fusion layer ('TypeA' or 'TypeB'). Defaults to 'TypeA'.
-
-    Returns:
-        Model: A Keras model instance with input shape (batch_size, in_dim, height, width) and
-               output shape (batch_size, out_dim, height, width).
-    """
+def VballNetV2(height, width, in_dim, out_dim, fusion_layer_type="TypeA"):
+  
     assert fusion_layer_type in [
         "TypeA",
         "TypeB",
@@ -181,8 +183,7 @@ def VballNetV1(height, width, in_dim, out_dim, fusion_layer_type="TypeA"):
     # Select fusion layer
     fusion_layer = (
         FusionLayerTypeA(num_frames=num_frames, out_dim=out_dim)
-        if fusion_layer_type == "TypeA"
-        else FusionLayerTypeB(num_frames=num_frames, out_dim=out_dim)
+       
     )
 
     # Input layer
@@ -241,6 +242,7 @@ def VballNetV1(height, width, in_dim, out_dim, fusion_layer_type="TypeA"):
     )(x)
     x = Activation("relu")(x)
     x = BatchNormalization()(x)
+    x = spatial_attention(x)  # Apply spatial attention
 
     # Decoder
     x = concatenate([UpSampling2D((2, 2), data_format="channels_first")(x), x2], axis=1)
@@ -277,6 +279,7 @@ def VballNetV1(height, width, in_dim, out_dim, fusion_layer_type="TypeA"):
         padding="same",
         data_format="channels_first",
     )(x)
+
     x = fusion_layer([x, residual_maps])
     x = Activation("sigmoid")(x)
 

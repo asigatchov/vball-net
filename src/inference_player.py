@@ -7,18 +7,19 @@ from collections import deque
 import os
 import time
 from tqdm import tqdm
-from model.VballNetFastV1 import VballNetFastV1
-from model.VballNetV1 import VballNetV1
-from model.TrackNetV4 import TrackNetV4
-from utils import custom_loss
+from model.PlayerNetFastV1 import PlayerNetFastV1
+import matplotlib
+matplotlib.use('Agg')  # Установить неинтерактивный бэкенд
+import matplotlib.pyplot as plt
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Volleyball ball detection and tracking")
+    parser = argparse.ArgumentParser(description="Volleyball ball detection and tracking with PlayerNetFastV1")
     parser.add_argument("--video_path", type=str, required=True, help="Path to input video file")
     parser.add_argument("--track_length", type=int, default=8, help="Length of the ball track")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory to save output video and CSV")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to model weights file (e.g., models/20250620_2352/vballNetV1_02.keras)")
-    parser.add_argument("--visualize", action="store_true", default=False, help="Enable visualization on display using cv2")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to model weights file (e.g., models/20250620_2352/PlayerNetFastV1_01.keras)")
+    parser.add_argument("--visualize", action="store_true", default=False, help="Enable visualization")
+
     parser.add_argument("--only_csv", action="store_true", default=False, help="Save only CSV, skip video output")
     return parser.parse_args()
 
@@ -26,21 +27,8 @@ def load_model(model_path, input_height=288, input_width=512):
     if not os.path.exists(model_path):
         raise ValueError(f"Model weights file not found: {model_path}")
 
-    model = None
-    if 'VballNetV1' in model_path:
-        model = VballNetV1(input_height, input_width, in_dim=9, out_dim=3)  # Three frames: in_dim=9, out_dim=3
-    elif 'VballNetFastV1' in model_path:
-        model = VballNetFastV1(input_height, input_width, in_dim=9, out_dim=3)
-    elif 'TrackNetV4' in model_path:
-        model = TrackNetV4(input_height, input_width, 'TypeB')
- 
-    elif  'PlayerNetFastV1' in model_path:
-        from model.PlayerNetFastV1 import PlayerNetFastV1
-        #    Создаём только PlayerNetFastV1 с 3 выходными каналами
-        model = PlayerNetFastV1(input_shape=(9, input_height, input_width), output_channels=3)
-    else:
-        raise ValueError("Model type not recognized in model_path")
-
+    # Создаём только PlayerNetFastV1 с 3 выходными каналами
+    model = PlayerNetFastV1(input_shape=(9, input_height, input_width), output_channels=3)
     model.load_weights(model_path)
     return model
 
@@ -71,14 +59,12 @@ def setup_csv_file(video_basename, output_dir):
     csv_path = os.path.join(output_dir, f'{video_basename}_predict_ball.csv')
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    # Initialize CSV with headers
     pd.DataFrame(columns=['Frame', 'Visibility', 'X', 'Y']).to_csv(csv_path, index=False)
     return csv_path
 
 def append_to_csv(result, csv_path):
     if csv_path is None:
         return
-    # Append single result to CSV
     pd.DataFrame([result]).to_csv(csv_path, mode='a', header=False, index=False)
 
 def preprocess_frame(frame, input_height=288, input_width=512):
@@ -87,7 +73,7 @@ def preprocess_frame(frame, input_height=288, input_width=512):
     return frame
 
 def postprocess_output(output, threshold=0.5, input_height=288, input_width=512):
-    # Теперь возвращает: (visibility, cx, cy, bbox_x, bbox_y, bbox_w, bbox_h)
+    # Обработка трёх выходных каналов (тепловых карт)
     results = []
     for frame_idx in range(3):
         heatmap = output[0, frame_idx, :, :]
@@ -100,12 +86,11 @@ def postprocess_output(output, threshold=0.5, input_height=288, input_width=512)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
                 cy = int(M["m01"] / M["m00"])
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                results.append((1, cx, cy, x, y, w, h))
+                results.append((1, cx, cy))
             else:
-                results.append((0, 0, 0, 0, 0, 0, 0))
+                results.append((0, 0, 0))
         else:
-            results.append((0, 0, 0, 0, 0, 0, 0))
+            results.append((0, 0, 0))
     return results
 
 def visualize_heatmaps(output, frame_index, input_height=288, input_width=512):
@@ -114,19 +99,15 @@ def visualize_heatmaps(output, frame_index, input_height=288, input_width=512):
         heatmap_norm = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX)
         heatmap_uint8 = heatmap_norm.astype(np.uint8)
         heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-        cv2.imshow(f'Heatmap Frame {frame_idx}', heatmap_color)
+        cv2.imshow(f'Heatmap Frame' , heatmap_color)
     cv2.waitKey(1)
 
-def draw_track(frame, track_points, current_color=(0, 0, 255), history_color=(255, 0, 0), current_ball_bbox=None):
+def draw_track(frame, track_points, current_color=(0, 0, 255), history_color=(255, 0, 0)):
     for point in list(track_points)[:-1]:
         if point is not None:
             cv2.circle(frame, point, 5, history_color, -1)
     if track_points and track_points[-1] is not None:
         cv2.circle(frame, track_points[-1], 5, current_color, -1)
-    # Draw green bounding box for current ball if provided
-    if current_ball_bbox is not None:
-        x, y, box_w, box_h = current_ball_bbox
-        cv2.rectangle(frame, (x, y), (x + box_w, y + box_h), (0, 255, 0), 2)
     return frame
 
 def main():
@@ -142,18 +123,13 @@ def main():
 
     frame_buffer = deque(maxlen=3)
     track_points = deque(maxlen=args.track_length)
-    prediction_buffer = {}
     frame_index = 0
 
     # Initialize progress bar
     pbar = tqdm(total=total_frames, desc="Processing video", unit="frame")
 
     while cap.isOpened():
-        start_time = time.time()  # Start time for FPS calculation
-
-        ret = None
         ret, frame = cap.read()
-        # ret, frame = cap.read()
         if not ret:
             break
 
@@ -166,18 +142,16 @@ def main():
                 frame_buffer.append(processed_frame)
 
         if len(frame_buffer) == 3:
-
             input_tensor = np.concatenate(frame_buffer, axis=2)
             input_tensor = np.expand_dims(input_tensor, axis=0)
             input_tensor = np.transpose(input_tensor, (0, 3, 1, 2))
 
             output = model.predict(input_tensor, verbose=0)
 
+            # Обработка трёх предсказаний (по одной тепловой карте на кадр)
             predictions = postprocess_output(output, input_height=input_height, input_width=input_width)
+            visibility, x, y = predictions[2]  # Используем предсказание для последнего кадра
 
-            # Теперь predictions[2] содержит (visibility, x, y, bbox_x, bbox_y, bbox_w, bbox_h)
-            visibility, x, y, bbox_x, bbox_y, bbox_w, bbox_h = predictions[2]
-            current_ball_bbox = None
             if visibility == 0:
                 x_orig, y_orig = -1, -1
                 if len(track_points) > 0:
@@ -186,12 +160,6 @@ def main():
                 x_orig = x * frame_width / input_width
                 y_orig = y * frame_height / input_height
                 track_points.append((int(x_orig), int(y_orig)))
-                # Масштабируем рамку из входного размера в размер оригинального кадра
-                bbox_x_orig = int(bbox_x * frame_width / input_width)
-                bbox_y_orig = int(bbox_y * frame_height / input_height)
-                bbox_w_orig = int(bbox_w * frame_width / input_width)
-                bbox_h_orig = int(bbox_h * frame_height / input_height)
-                current_ball_bbox = (bbox_x_orig, bbox_y_orig, bbox_w_orig, bbox_h_orig)
 
             result = {
                 'Frame': frame_index,
@@ -203,9 +171,8 @@ def main():
 
             if args.visualize or out_writer is not None:
                 vis_frame = frame.copy()
-                vis_frame = draw_track(vis_frame, track_points, current_ball_bbox=current_ball_bbox)
+                vis_frame = draw_track(vis_frame, track_points)
                 if args.visualize:
-                    #visualize_heatmaps(output, frame_index, input_height, input_width)
                     cv2.namedWindow(
                         "Ball Tracking", cv2.WINDOW_NORMAL
                     )  # Create window with freedom of dimensions
@@ -216,12 +183,8 @@ def main():
                 if out_writer is not None:
                     out_writer.write(vis_frame)
 
-        # Calculate and print FPS
-        end_time = time.time()
-        batch_time = end_time - start_time
-        batch_fps = 1 / batch_time if batch_time > 0 else 0
 
-        # Update progress bar (increment by 3 since we process 3 frames at a time)
+        # Update progress bar
         pbar.update(1)
         frame_index += 1
 
@@ -231,8 +194,6 @@ def main():
     cap.release()
     if out_writer is not None:
         out_writer.release()
-    if args.visualize:
-        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
