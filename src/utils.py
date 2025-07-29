@@ -15,6 +15,9 @@ from model.VballNetV1 import VballNetV1
 import tensorflow as tf
 from tensorflow.keras.callbacks import Callback
 import pandas as pd
+import logging
+
+logger = logging.getLogger(__name__)
 
 def limit_gpu_memory(memory_limit_mb):
     """Limit GPU memory usage for the current TensorFlow process."""
@@ -169,8 +172,9 @@ def load_data(track_id, csv_path, frame_indices, mode, seq, grayscale=False):
         frames.shape,
         heatmaps.shape,
     )
-    return frames, heatmaps
 
+
+    return frames, heatmaps
 
 def get_video_and_csv_pairs(mode, seq):
     """
@@ -242,6 +246,141 @@ def get_video_and_csv_pairs(mode, seq):
                 )
                 continue
             pairs.append((track_id, csv_path, frame_indices))
+    logger.debug("Found %d valid pairs for mode %s", len(pairs), mode)
+    return pairs
+
+
+def get_video_and_csv_pairs_bad(mode, seq):
+    """
+    Returns a list of (track_id, csv_path, frame_indices) tuples for videos in DATASET_DIR/mode.
+    For training mode, applies probabilistic frame pruning: 45% odd frames, 45% even frames, 10% all frames.
+
+    Args:
+        mode (str): 'train' or 'test'.
+        seq (int): Number of frames in sequence.
+
+    Returns:
+        list: List of tuples (track_id, csv_path, frame_indices).
+    """
+    pairs = []
+    mode_dir = os.path.join(DATASET_DIR, mode)
+    if not os.path.exists(mode_dir):
+        logger.warning("Directory %s does not exist", mode_dir)
+        return pairs
+
+    video_dirs = [
+        d for d in os.listdir(mode_dir) if os.path.isdir(os.path.join(mode_dir, d))
+    ]
+    for track_id in video_dirs:
+        csv_path = os.path.join(mode_dir, f"{track_id}_ball.csv")
+        if not os.path.exists(csv_path):
+            logger.warning(
+                "CSV not found for track_id %s at %s, skipping", track_id, csv_path
+            )
+            continue
+        df = pd.read_csv(
+            csv_path,
+            dtype={
+                "Frame": np.int64,
+                "X": np.int64,
+                "Y": np.int64,
+                "Visibility": np.int64,
+            },
+        )
+        df = df.fillna({"X": 0, "Y": 0, "Visibility": 0})
+
+        if not np.all(df["Frame"].values == np.arange(len(df))):
+            logger.warning("Non-sequential frame indices in %s, skipping", csv_path)
+            continue
+
+        num_frames = len(df)
+        if num_frames < seq:
+            logger.warning(
+                "%s has %d frames, need at least %d, skipping",
+                csv_path,
+                num_frames,
+                seq,
+            )
+            continue
+
+        # Get all possible frame indices
+        all_indices = list(range(num_frames))
+        # Filter for odd and even indices
+        odd_indices = all_indices[1::2]  # 1, 3, 5, ...
+        even_indices = all_indices[0::2]  # 0, 2, 4, ...
+
+        # Ensure enough frames for sequence after pruning
+        min_frames_needed = (
+            seq if mode == "test" else (seq + 1) // 2
+        )  # Ceiling for odd/even
+        if (
+            len(odd_indices) < min_frames_needed
+            or len(even_indices) < min_frames_needed
+        ):
+            logger.warning(
+                "%s has insufficient frames after pruning (odd: %d, even: %d, need: %d), skipping",
+                csv_path,
+                len(odd_indices),
+                len(even_indices),
+                min_frames_needed,
+            )
+            continue
+
+        # Generate sequences
+        for t in range(seq - 1, num_frames):
+            if mode == "train":
+                # Probabilistic frame selection
+                rand_val = tf.random.uniform((), 0, 1).numpy()
+                if rand_val < 0.45:
+                    # 45% chance: select from odd frames
+                    available_indices = [
+                        i for i in odd_indices if i >= t - seq + 1 and i <= t
+                    ]
+                elif rand_val < 0.9:
+                    # 45% chance: select from even frames
+                    available_indices = [
+                        i for i in even_indices if i >= t - seq + 1 and i <= t
+                    ]
+                else:
+                    # 10% chance: select all frames
+                    available_indices = list(range(t - seq + 1, t + 1))
+            else:
+                # Test mode: use all frames
+                available_indices = list(range(t - seq + 1, t + 1))
+
+            # Ensure we have enough indices for a sequence
+            if len(available_indices) < seq:
+                continue
+
+            # Select the last 'seq' indices to form a consecutive sequence
+            frame_indices = available_indices[-seq:]
+            if max(frame_indices) >= len(df):
+                logger.warning(
+                    "Frame indices %s exceed CSV length %d for %s, skipping",
+                    frame_indices,
+                    len(df),
+                    csv_path,
+                )
+                continue
+
+            # Verify all frames exist
+            track_dir = os.path.join(mode_dir, track_id)
+            missing = [
+                idx
+                for idx in frame_indices
+                if not os.path.exists(os.path.join(track_dir, f"{idx}{IMG_FORMAT}"))
+            ]
+            if missing:
+                logger.warning(
+                    "Missing frames %s for track_id %s, skipping sequence %s",
+                    missing,
+                    track_id,
+                    frame_indices,
+                )
+                continue
+
+            pairs.append((track_id, csv_path, frame_indices))
+
     logger.debug("Found %d valid pairs for mode %s", len(pairs), mode)
     return pairs
 

@@ -66,6 +66,12 @@ def load_model(model_path, input_height=288, input_width=512):
         model = VballNetV1(
             input_height, input_width, in_dim=9, out_dim=9
         )  # 9 grayscale кадров, 9 тепловых карт
+    elif "VballNetV2b_seq9_grayscale" in model_path:
+        from model.VballNetV2b import VballNetV2b  # Импортируем модель VballNetV1
+        model = VballNetV2b(
+            input_height, input_width, in_dim=9, out_dim=9
+        )  # 9 grayscale кадров, 9 тепловых карт
+
     elif "VballNetV2_seq9_grayscale" in model_path:
         from model.VballNetV2 import VballNetV2  # Импортируем модель VballNetV1
         model = VballNetV2(

@@ -13,6 +13,8 @@ from utils import create_heatmap, custom_loss, limit_gpu_memory, OutcomeMetricsC
 
 from utils import get_video_and_csv_pairs, load_data
 
+from tensorflow.keras.mixed_precision import set_global_policy
+set_global_policy('mixed_float16')
 # Parameters
 IMG_HEIGHT = HEIGHT  # 288
 IMG_WIDTH = WIDTH  # 512
@@ -63,7 +65,11 @@ def get_model(model_name, height, width, seq, grayscale=False):
         return TrackNetV4(height, width, 'TypeB')
 
     print(f"Creating model {model_name} with height={height}, width={width}, in_dim={in_dim}, out_dim={out_dim}, seq={seq}, grayscale={grayscale}")
-    
+    if model_name == 'VballNetV2b':
+        from model.VballNetV2b import VballNetV2b
+        return VballNetV2b(height, width, in_dim=in_dim, out_dim=out_dim)
+
+
     if model_name == 'VballNetV2':
         from model.VballNetV2 import VballNetV2
         return VballNetV2(height, width, in_dim=in_dim, out_dim=out_dim)
@@ -254,14 +260,12 @@ def main():
         args.gpu_memory_limit,
     )
 
-
-    
     limit_gpu_memory(args.gpu_memory_limit)
     if args.seq < 1:
         logger.error("Sequence length must be at least 1, got %d", args.seq)
         raise ValueError(f"Invalid sequence length: {args.seq}")
 
-    if args.model_name not in ["VballNetFastV1", "VballNetV1",'VballNetV2', "PlayerNetFastV1", "TrackNetV4"]:
+    if args.model_name not in ["VballNetFastV1", "VballNetV1",' VballNetV2', "VballNetV2b", "PlayerNetFastV1", "TrackNetV4"]:
         logger.error(
             "Invalid model name: %s. Must be 'VballNetFastV1' or 'VballNetV1'",
             args.model_name,
@@ -399,9 +403,16 @@ def main():
                 model_save_dir,
             )
 
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-        initial_learning_rate=1e-3, decay_steps=train_size * 2, decay_rate=0.9
+    # lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    #     initial_learning_rate=1e-3, decay_steps=train_size * 2, decay_rate=0.9
+    # )
+
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        #initial_learning_rate=1e-3,
+        initial_learning_rate=5e-3,
+        decay_steps=train_size * args.epochs
     )
+
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     model.compile(optimizer=optimizer, loss=custom_loss, metrics=["mae"])
@@ -432,12 +443,12 @@ def main():
             log_dir=os.path.join(MODEL_DIR, "logs", model_save_name)
         ),
         tf.keras.callbacks.EarlyStopping(patience=30, monitor="val_loss"),
-        # OutcomeMetricsCallback(
-        #     validation_data=test_dataset,
-        #     tol=10,
-        #     log_dir=os.path.join(MODEL_DIR, "logs", f"{model_save_name}/outcome"),
-        # ),
-        # LearningRateLogger(lr_schedule, train_size),
+        OutcomeMetricsCallback(
+            validation_data=test_dataset,
+            tol=10,
+            log_dir=os.path.join(MODEL_DIR, "logs", f"{model_save_name}/outcome"),
+        ),
+        LearningRateLogger(lr_schedule, train_size),
         # VisualizationCallback(
         #     test_dataset=test_dataset,
         #     save_dir=os.path.join(MODEL_DIR, "visualizations"),
