@@ -13,8 +13,10 @@ from utils import create_heatmap, custom_loss, limit_gpu_memory, OutcomeMetricsC
 
 from utils import get_video_and_csv_pairs, load_data
 
-from tensorflow.keras.mixed_precision import set_global_policy
-set_global_policy('mixed_float16')
+#from tensorflow.keras.mixed_precision import set_global_policy
+#set_global_policy('mixed_float16')
+
+
 # Parameters
 IMG_HEIGHT = HEIGHT  # 288
 IMG_WIDTH = WIDTH  # 512
@@ -403,15 +405,15 @@ def main():
                 model_save_dir,
             )
 
-    # lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-    #     initial_learning_rate=1e-3, decay_steps=train_size * 2, decay_rate=0.9
-    # )
-
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-        #initial_learning_rate=1e-3,
-        initial_learning_rate=5e-3,
-        decay_steps=train_size * args.epochs
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1e-3, decay_steps=train_size * 2, decay_rate=0.9
     )
+
+    # lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+    #     #initial_learning_rate=1e-3,
+    #     initial_learning_rate=5e-3,
+    #     decay_steps=train_size * args.epochs
+    # )
 
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
@@ -448,7 +450,7 @@ def main():
             tol=10,
             log_dir=os.path.join(MODEL_DIR, "logs", f"{model_save_name}/outcome"),
         ),
-        LearningRateLogger(lr_schedule, train_size),
+        # LearningRateLogger(lr_schedule, train_size),
         # VisualizationCallback(
         #     test_dataset=test_dataset,
         #     save_dir=os.path.join(MODEL_DIR, "visualizations"),

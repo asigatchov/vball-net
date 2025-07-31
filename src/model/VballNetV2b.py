@@ -1,36 +1,64 @@
 import tensorflow as tf
 from tensorflow.keras.layers import (
-    Input, Conv2D, SeparableConv2D, MaxPooling2D, UpSampling2D, concatenate, Reshape, Layer, Lambda
+    Input, Conv2D, SeparableConv2D, MaxPooling2D, UpSampling2D, concatenate, Reshape, Layer, Lambda,
+    Activation,
+    BatchNormalization,
 )
 from tensorflow.keras.models import Model
 
-# DyT Layer (Dynamic Tanh)
+# # DyT Layer (Dynamic Tanh)
+# class DyT(Layer):
+#     """
+#     Dynamic Tanh (DyT) Layer: применяет поэлементную операцию tanh с обучаемыми параметрами.
+#     """
+#     def __init__(self, **kwargs):
+#         super(DyT, self).__init__(**kwargs)
+#         self.alpha = self.add_weight(
+#             name='alpha',
+#             shape=(),
+#             initializer=tf.constant_initializer(0.5),
+#             trainable=True
+#         )
+#         self.beta = self.add_weight(
+#             name='beta',
+#             shape=(),
+#             initializer=tf.constant_initializer(0.1),
+#             trainable=True
+#         )
+
+#     def call(self, inputs):
+#         # Применяем tanh с обучаемыми масштабом и сдвигом: alpha * tanh(inputs) + beta
+#         return self.alpha * tf.nn.tanh(inputs) + self.beta
+
+#     def get_config(self):
+#         config = super(DyT, self).get_config()
+#         return config
+
+
 class DyT(Layer):
-    """
-    Dynamic Tanh (DyT) Layer: применяет поэлементную операцию tanh с обучаемыми параметрами.
-    """
     def __init__(self, **kwargs):
         super(DyT, self).__init__(**kwargs)
         self.alpha = self.add_weight(
-            name='alpha',
+            name="alpha",
             shape=(),
-            initializer=tf.constant_initializer(1.0),
-            trainable=True
+            initializer=tf.constant_initializer(0.5),
+            trainable=True,
         )
         self.beta = self.add_weight(
-            name='beta',
+            name="beta",
             shape=(),
-            initializer=tf.constant_initializer(0.0),
-            trainable=True
+            initializer=tf.constant_initializer(0.1),
+            trainable=True,
         )
 
     def call(self, inputs):
-        # Применяем tanh с обучаемыми масштабом и сдвигом: alpha * tanh(inputs) + beta
-        return self.alpha * tf.nn.tanh(inputs) + self.beta
+        # softsign(x) = x / (1 + |x|) — более легковесная, чем tanh
+        return self.alpha * tf.nn.softsign(inputs) + self.beta
 
     def get_config(self):
         config = super(DyT, self).get_config()
         return config
+
 
 # Utility functions
 def rearrange_tensor(input_tensor, order):
@@ -184,7 +212,10 @@ def VballNetV2b(height, width, in_dim, out_dim, fusion_layer_type="TypeA"):
         pointwise_initializer="random_uniform", padding="same",
         data_format="channels_first"
     )(imgs_input)
+
     x = DyT()(x)
+    #x = Activation("relu")(x)
+    #x = BatchNormalization()(x)
 
     x1 = SeparableConv2D(
         32, (3, 3), depthwise_initializer="random_uniform",

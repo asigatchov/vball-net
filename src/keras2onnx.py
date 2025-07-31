@@ -3,6 +3,7 @@ import tensorflow as tf
 import tf2onnx
 import onnx
 from model.VballNetV1 import MotionPromptLayer, FusionLayerTypeA
+from model.VballNetV2b import spatial_attention, DyT
 from utils import custom_loss
 
 # Parse command-line arguments
@@ -16,7 +17,7 @@ args = parser.parse_args()
 custom_objects = {
     'MotionPromptLayer': MotionPromptLayer,
     'FusionLayerTypeA': FusionLayerTypeA,
-    'custom_loss': custom_loss
+    'custom_loss': custom_loss,
 }
 
 # Load the Keras model
