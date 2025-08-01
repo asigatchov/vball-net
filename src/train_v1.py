@@ -409,12 +409,6 @@ def main():
         initial_learning_rate=1e-3, decay_steps=train_size * 2, decay_rate=0.9
     )
 
-    # lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-    #     #initial_learning_rate=1e-3,
-    #     initial_learning_rate=5e-3,
-    #     decay_steps=train_size * args.epochs
-    # )
-
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     model.compile(optimizer=optimizer, loss=custom_loss, metrics=["mae"])

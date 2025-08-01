@@ -6,6 +6,7 @@ import cv2
 import os
 import argparse
 import logging
+import json
 from datetime import datetime
 import glob
 from constants import HEIGHT, WIDTH, SIGMA, DATASET_DIR, IMG_FORMAT
@@ -17,61 +18,73 @@ from utils import (
     VisualizationCallback,
 )
 from utils import get_video_and_csv_pairs, load_data
-import multiprocessing as mp
-from multiprocessing import Manager, Barrier
 
-# Parameters
+# Параметры
 IMG_HEIGHT = HEIGHT  # 288
 IMG_WIDTH = WIDTH  # 512
-BATCH_SIZE = 4  # Reduced for stability
-MAG = 1.0  # Magnitude for heatmap
-RATIO = 1.0  # Scaling factor for coordinates
-MODEL_DIR = "models"  # Directory for model saving
+BATCH_SIZE = 4  # Уменьшено для стабильности
+MAG = 1.0  # Magnitude для тепловых карт
+RATIO = 1.0  # Коэффициент масштабирования координат
+MODEL_DIR = "models"  # Директория для сохранения модели
 
 
-def setup_logging(debug=False, process_id=0):
+def setup_logging(debug=False):
     """
-    Configure logging with specified level based on debug flag and process ID.
+    Настройка логирования с указанным уровнем в зависимости от флага debug.
     """
     level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
         level=level,
-        format=f"[Process {process_id}] %(asctime)s - %(levelname)s - %(message)s",
+        format="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger = logging.getLogger(__name__)
     return logger
 
 
+logger = setup_logging()
+
+
+# Функция для получения модели (без изменений)
 def get_model(model_name, height, width, seq, grayscale=False):
-    """
-    Retrieve an instance of a TrackNet model based on the specified model name.
-    For grayscale mode with seq=9, set out_dim=9.
-    """
     in_dim = seq if grayscale else seq * 3
-    out_dim = (
-        seq  # For grayscale, out_dim=seq (e.g., 9 for seq=9); for RGB, out_dim=seq
-    )
+    out_dim = seq
+    from model.VballNetFastV1 import VballNetFastV1
     from model.VballNetV1 import VballNetV1
 
-    logger = logging.getLogger(__name__)
-    logger.info(
-        f"Creating model {model_name} with in_dim={in_dim}, out_dim={out_dim}, grayscale={grayscale}"
+    if model_name == "PlayerNetFastV1":
+        from model.PlayerNetFastV1 import PlayerNetFastV1
+
+        return PlayerNetFastV1(input_shape=(9, height, width), output_channels=3)
+    if model_name == "VballNetFastV1":
+        return VballNetFastV1(height, width, in_dim=in_dim, out_dim=out_dim)
+    if model_name == "TrackNetV4":
+        from model.TrackNetV4 import TrackNetV4
+
+        return TrackNetV4(height, width, "TypeB")
+    print(
+        f"Creating model {model_name} with height={height}, width={width}, in_dim={in_dim}, out_dim={out_dim}, seq={seq}, grayscale={grayscale}"
     )
+    if model_name == "VballNetV2b":
+        from model.VballNetV2b import VballNetV2b
+
+        return VballNetV2b(height, width, in_dim=in_dim, out_dim=out_dim)
+    if model_name == "VballNetV2":
+        from model.VballNetV2 import VballNetV2
+
+        return VballNetV2(height, width, in_dim=in_dim, out_dim=out_dim)
     return VballNetV1(height, width, in_dim=in_dim, out_dim=out_dim)
 
 
+# Функции reshape_tensors, mixup, augment_sequence (без изменений)
 def reshape_tensors(frames, heatmaps, seq, grayscale=False):
-    """
-    Reshape tensors to (channels, height, width) for channels_first.
-    """
     logger = logging.getLogger(__name__)
     frames = tf.ensure_shape(
         frames, [IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)]
     )
     heatmaps = tf.ensure_shape(heatmaps, [IMG_HEIGHT, IMG_WIDTH, seq])
-    frames = tf.transpose(frames, [2, 0, 1])  # (seq*(1 or 3), 288, 512)
-    heatmaps = tf.transpose(heatmaps, [2, 0, 1])  # (seq, 288, 512)
+    frames = tf.transpose(frames, [2, 0, 1])
+    heatmaps = tf.transpose(heatmaps, [2, 0, 1])
     logger.debug(
         "Reshaped tensors: frames %s, heatmaps %s", frames.shape, heatmaps.shape
     )
@@ -79,9 +92,6 @@ def reshape_tensors(frames, heatmaps, seq, grayscale=False):
 
 
 def mixup(frames, heatmaps, alpha=0.5):
-    """
-    Apply mixup augmentation to frames and heatmaps.
-    """
     logger = logging.getLogger(__name__)
     batch_size = tf.shape(frames)[0]
     gamma1 = tf.random.gamma(shape=[batch_size], alpha=alpha)
@@ -101,9 +111,6 @@ def mixup(frames, heatmaps, alpha=0.5):
 
 
 def augment_sequence(frames, heatmaps, seq, grayscale=False, alpha=-1.0):
-    """
-    Apply data augmentation to frames and heatmaps using TensorFlow.
-    """
     logger = logging.getLogger(__name__)
     try:
         tf.debugging.assert_shapes(
@@ -144,56 +151,153 @@ def augment_sequence(frames, heatmaps, seq, grayscale=False, alpha=-1.0):
         return frames, heatmaps
     except Exception as e:
         logger.error("Error in augment_sequence: %s", str(e))
+        logger.error("Frames shape: %s", frames.shape if frames is not None else "None")
+        logger.error(
+            "Heatmaps shape: %s", heatmaps.shape if heatmaps is not None else "None"
+        )
         raise
 
 
-def synchronize_weights(models, shared_weights, process_id, barrier):
+# Функции для сохранения и загрузки параметров графика скорости обучения (без изменений)
+def save_lr_schedule_params(save_dir, initial_learning_rate, decay_steps, decay_rate):
     """
-    Synchronize weights between two models by averaging.
+    Сохраняет параметры графика скорости обучения в JSON-файл.
     """
+    lr_params = {
+        "initial_learning_rate": float(initial_learning_rate),
+        "decay_steps": int(decay_steps),
+        "decay_rate": float(decay_rate),
+    }
+    with open(os.path.join(save_dir, "lr_schedule_params.json"), "w") as f:
+        json.dump(lr_params, f, indent=4)
+    logger.info(
+        "Сохранены параметры графика скорости обучения в %s",
+        os.path.join(save_dir, "lr_schedule_params.json"),
+    )
+
+
+def load_lr_schedule_params(save_dir):
+    """
+    Загружает параметры графика скорости обучения из JSON-файла.
+    Возвращает None, если файл не найден.
+    """
+    params_file = os.path.join(save_dir, "lr_schedule_params.json")
+    if os.path.exists(params_file):
+        with open(params_file, "r") as f:
+            lr_params = json.load(f)
+        logger.info("Загружены параметры графика скорости обучения из %s", params_file)
+        return (
+            lr_params["initial_learning_rate"],
+            lr_params["decay_steps"],
+            lr_params["decay_rate"],
+        )
+    logger.warning(
+        "Файл параметров графика скорости обучения не найден: %s", params_file
+    )
+    return None
+
+
+def parser_args():
+    parser = argparse.ArgumentParser(description="Train VballNet model.")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the latest checkpoint.",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument(
+        "--seq", type=int, default=3, help="Number of frames in sequence."
+    )
+    parser.add_argument(
+        "--grayscale",
+        action="store_true",
+        help="Use grayscale frames with seq input/output channels.",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="VballNetFastV1",
+        help="Model name to train (VballNetFastV1 or VballNetV1).",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=50,
+        help="Number of epochs to train (default: 50).",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=-1.0,
+        help="Alpha for mixup augmentation, -1 means no mixup.",
+    )
+    parser.add_argument(
+        "--gpu_memory_limit",
+        type=int,
+        default=-1,
+        help="Limit GPU memory usage in MB, -1 means no limit.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parser_args()
     logger = logging.getLogger(__name__)
-    weights = models[process_id].get_weights()
-    shared_weights[process_id] = weights
-    barrier.wait()  # Wait for both processes to save weights
-    if process_id == 0:
-        avg_weights = []
-        for w1, w2 in zip(shared_weights[0], shared_weights[1]):
-            avg_w = (w1 + w2) / 2.0
-            avg_weights.append(avg_w)
-        shared_weights[0] = avg_weights
-        shared_weights[1] = avg_weights
-    barrier.wait()  # Ensure both processes wait until averaging is done
-    models[process_id].set_weights(shared_weights[process_id])
-    logger.info(f"Process {process_id}: Weights synchronized")
-
-
-def train_process(process_id, args, train_pairs, test_pairs, shared_weights, barrier):
-    """
-    Training function for a single process.
-    """
-    logger = setup_logging(args.debug, process_id)
+    logger.info(
+        "Starting training script with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s gpu_memory_limit=%d",
+        args.seq,
+        args.grayscale,
+        args.debug,
+        args.resume,
+        args.model_name,
+        args.alpha,
+        args.gpu_memory_limit,
+    )
     limit_gpu_memory(args.gpu_memory_limit)
     if args.seq < 1:
         logger.error("Sequence length must be at least 1, got %d", args.seq)
         raise ValueError(f"Invalid sequence length: {args.seq}")
-
-    # Split training pairs for this process
-    split_idx = len(train_pairs) // 2
-    if process_id == 0:
-        process_train_pairs = train_pairs[:split_idx]
-    else:
-        process_train_pairs = train_pairs[split_idx:]
-    logger.info(
-        f"Process {process_id}: Number of training pairs: %d", len(process_train_pairs)
+    if args.model_name not in [
+        "VballNetFastV1",
+        "VballNetV1",
+        "VballNetV2",
+        "VballNetV2b",
+        "PlayerNetFastV1",
+        "TrackNetV4",
+    ]:
+        logger.error(
+            "Invalid model name: %s. Must be 'VballNetFastV1' or 'VballNetV1'",
+            args.model_name,
+        )
+        raise ValueError(f"Invalid model name: {args.model_name}")
+    model_name_suffix = (
+        f"_seq{args.seq}_grayscale" if args.grayscale and args.seq == 9 else ""
     )
-
-    # Create datasets
+    model_save_name = f"{args.model_name}{model_name_suffix}"
+    model_save_dir = os.path.join(MODEL_DIR, model_save_name)
+    os.makedirs(model_save_dir, exist_ok=True)
+    logger.info("Created model save directory: %s", model_save_dir)
+    train_pairs = get_video_and_csv_pairs("train", args.seq)
+    test_pairs = get_video_and_csv_pairs("test", args.seq)
+    logger.info("Number of training pairs: %d", len(train_pairs))
+    logger.info("Number of test pairs: %d", len(test_pairs))
+    if len(train_pairs) == 0:
+        logger.error(
+            "No training data found. Check DATASET_DIR/train and frame/CSV files."
+        )
+        raise ValueError(
+            "No training data found. Check DATASET_DIR/train and frame/CSV files."
+        )
+    if len(test_pairs) == 0:
+        logger.warning(
+            "No test data found. Check DATASET_DIR/test and frame/CSV files."
+        )
     train_dataset = (
         tf.data.Dataset.from_tensor_slices(
             (
-                [p[0] for p in process_train_pairs],
-                [p[1] for p in process_train_pairs],
-                [p[2] for p in process_train_pairs],
+                [p[0] for p in train_pairs],
+                [p[1] for p in train_pairs],
+                [p[2] for p in train_pairs],
             )
         )
         .map(
@@ -220,15 +324,12 @@ def train_process(process_id, args, train_pairs, test_pairs, shared_weights, bar
         )
         .batch(BATCH_SIZE)
     )
-
     if args.alpha > 0:
         train_dataset = train_dataset.map(
             lambda frames, heatmaps: mixup(frames, heatmaps, args.alpha),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
-
     train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
-
     test_dataset = (
         tf.data.Dataset.from_tensor_slices(
             (
@@ -256,11 +357,10 @@ def train_process(process_id, args, train_pairs, test_pairs, shared_weights, bar
         .batch(BATCH_SIZE)
         .prefetch(tf.data.AUTOTUNE)
     )
-
     train_size = tf.data.experimental.cardinality(train_dataset).numpy()
-    logger.info(f"Process {process_id}: Number of training batches: %d", train_size)
-
-    # Initialize model
+    test_size = tf.data.experimental.cardinality(test_dataset).numpy()
+    logger.info("Number of training batches: %d", train_size)
+    logger.info("Number of test batches: %d", test_size)
     model = get_model(
         args.model_name,
         height=IMG_HEIGHT,
@@ -268,151 +368,159 @@ def train_process(process_id, args, train_pairs, test_pairs, shared_weights, bar
         seq=args.seq,
         grayscale=args.grayscale,
     )
-    models = {process_id: model}  # Store model for this process
-
-    # Load checkpoint if resuming
-    model_name_suffix = f"_seq{args.seq}_grayscale" if args.grayscale else ""
-    model_save_name = f"{args.model_name}{model_name_suffix}"
-    model_save_dir = os.path.join(MODEL_DIR, model_save_name)
-    os.makedirs(model_save_dir, exist_ok=True)
-
+    model.summary(print_fn=lambda x: logger.info(x))
     initial_epoch = 0
+    initial_learning_rate = 1e-3
+    decay_steps = train_size * 2
+    decay_rate = 0.9
     if args.resume:
-        checkpoint_files = glob.glob(
-            os.path.join(model_save_dir, f"{model_save_name}_*.keras")
+        # Проверяем наличие последней контрольной точки
+        latest_checkpoint = os.path.join(
+            model_save_dir, f"{model_save_name}_latest.keras"
         )
-        if checkpoint_files:
-            latest_checkpoint = max(checkpoint_files, key=os.path.getmtime)
-            logger.info(f"Process {process_id}: Resuming from %s", latest_checkpoint)
+        if os.path.exists(latest_checkpoint):
+            logger.info(
+                "Resuming training from latest checkpoint: %s", latest_checkpoint
+            )
             model = tf.keras.models.load_model(
                 latest_checkpoint, custom_objects={"custom_loss": custom_loss}
             )
-            epoch_str = (
-                os.path.basename(latest_checkpoint).split("_")[-1].replace(".keras", "")
+            # Извлекаем эпоху из имени файла, если оно содержит номер эпохи
+            checkpoint_files = glob.glob(
+                os.path.join(
+                    model_save_dir, f"{model_save_name}/{model_save_name}_*.keras"
+                )
             )
-            initial_epoch = int(epoch_str) if epoch_str.isdigit() else 0
+            if checkpoint_files:
+                latest_epoch_file = max(checkpoint_files, key=os.path.getmtime)
+                epoch_str = (
+                    os.path.basename(latest_epoch_file)
+                    .split("_")[-1]
+                    .replace(".keras", "")
+                )
+                initial_epoch = int(epoch_str) if epoch_str.isdigit() else 0
+            else:
+                initial_epoch = 0
+            # Загружаем параметры графика скорости обучения
+            lr_params = load_lr_schedule_params(model_save_dir)
+            if lr_params:
+                initial_learning_rate, decay_steps, decay_rate = lr_params
+                logger.info(
+                    "Восстановлены параметры графика: initial_learning_rate=%f, decay_steps=%d, decay_rate=%f",
+                    initial_learning_rate,
+                    decay_steps,
+                    decay_rate,
+                )
         else:
             logger.warning(
-                f"Process {process_id}: No checkpoints found, starting from scratch."
+                "No latest checkpoint found for %s in %s, starting training from scratch.",
+                model_save_name,
+                model_save_dir,
             )
-
-    # Compile model
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-        initial_learning_rate=1e-3, decay_steps=train_size * 2, decay_rate=0.9
+        initial_learning_rate=initial_learning_rate,
+        decay_steps=decay_steps,
+        decay_rate=decay_rate,
     )
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     model.compile(optimizer=optimizer, loss=custom_loss, metrics=["mae"])
-    logger.info(f"Process {process_id}: Model compiled with Adam, custom_loss, mae")
-
-    # Callbacks
-    filepath = os.path.join(
-        model_save_dir, f"{model_save_name}_{process_id}_{{epoch:02d}}.keras"
+    logger.info(
+        "Model compiled with optimizer=Adam(lr_schedule), loss=custom_loss, metrics=['mae']"
     )
+    # Пути для сохранения контрольных точек
+    latest_checkpoint_path = os.path.join(
+        model_save_dir, f"{model_save_name}_latest.keras"
+    )
+    best_checkpoint_path = os.path.join(model_save_dir, f"{model_save_name}_best.keras")
+    epoch_checkpoint_path = os.path.join(
+        model_save_dir, f"{model_save_name}/{model_save_name}_{{epoch:02d}}.keras"
+    )
+    # Сохраняем параметры графика скорости обучения
+    save_lr_schedule_params(
+        model_save_dir, initial_learning_rate, decay_steps, decay_rate
+    )
+
+    class LearningRateLogger(tf.keras.callbacks.Callback):
+        def __init__(self, lr_schedule, train_size):
+            super().__init__()
+            self.lr_schedule = lr_schedule
+            self.train_size = train_size
+
+        def on_epoch_begin(self, epoch, logs=None):
+            current_step = epoch * self.train_size
+            current_lr = self.lr_schedule(current_step).numpy()
+            logger.info(f"Epoch {epoch + 1}: Learning rate = {current_lr}")
+
     callbacks = [
+        # Сохранение последней контрольной точки
         tf.keras.callbacks.ModelCheckpoint(
-            filepath=filepath, save_best_only=False, monitor="val_loss"
+            filepath=latest_checkpoint_path,
+            save_best_only=False,
+            save_weights_only=False,
+            monitor="val_loss",
+            verbose=1,
+        ),
+        # Сохранение лучшей контрольной точки по val_loss
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=best_checkpoint_path,
+            save_best_only=True,
+            save_weights_only=False,
+            monitor="val_loss",
+            mode="min",
+            verbose=1,
+        ),
+        # Сохранение контрольной точки для каждой эпохи (как в исходном коде)
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=epoch_checkpoint_path,
+            save_best_only=False,
+            save_weights_only=False,
+            monitor="val_loss",
+            verbose=1,
         ),
         tf.keras.callbacks.TensorBoard(
-            log_dir=os.path.join(
-                MODEL_DIR, "logs", f"{model_save_name}_process_{process_id}"
-            )
+            log_dir=os.path.join(MODEL_DIR, "logs", model_save_name)
         ),
         tf.keras.callbacks.EarlyStopping(patience=30, monitor="val_loss"),
-    ]
-
-    # Training loop with synchronization
-    for epoch in range(initial_epoch, args.epochs):
-        logger.info(f"Process {process_id}: Starting epoch {epoch + 1}")
-        model.fit(
-            train_dataset,
+        OutcomeMetricsCallback(
             validation_data=test_dataset,
-            epochs=1,
-            initial_epoch=0,
-            callbacks=callbacks,
-            verbose=1 if process_id == 0 else 0,
-        )
-        logger.info(f"Process {process_id}: Epoch {epoch + 1} completed")
-        synchronize_weights(models, shared_weights, process_id, barrier)
-
-    logger.info(f"Process {process_id}: Training completed")
-
-
-def main():
-    logger = setup_logging()
-    parser = argparse.ArgumentParser(
-        description="Train VballNet model with parallel processes."
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume training from the latest checkpoint.",
-    )
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
-    parser.add_argument(
-        "--seq", type=int, default=9, help="Number of frames in sequence."
-    )
-    parser.add_argument(
-        "--grayscale", action="store_true", help="Use grayscale frames."
-    )
-    parser.add_argument(
-        "--model_name", type=str, default="VballNetV1", help="Model name to train."
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=50, help="Number of epochs to train."
-    )
-    parser.add_argument(
-        "--alpha", type=float, default=-1.0, help="Alpha for mixup augmentation."
-    )
-    parser.add_argument(
-        "--gpu_memory_limit", type=int, default=-1, help="Limit GPU memory usage in MB."
-    )
-    args = parser.parse_args()
-
+            tol=10,
+            log_dir=os.path.join(MODEL_DIR, "logs", f"{model_save_name}/outcome"),
+        ),
+        LearningRateLogger(lr_schedule, train_size),
+    ]
     logger.info(
-        "Starting parallel training with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s, gpu_memory_limit=%d",
-        args.seq,
-        args.grayscale,
-        args.debug,
-        args.resume,
-        args.model_name,
-        args.alpha,
-        args.gpu_memory_limit,
+        "Callbacks configured: ModelCheckpoint (latest, best, epoch), TensorBoard, EarlyStopping, OutcomeMetricsCallback, LearningRateLogger"
     )
-
-    if args.model_name not in ["VballNetV1"]:
-        logger.error("Invalid model name: %s. Must be 'VballNetV1'", args.model_name)
-        raise ValueError(f"Invalid model name: {args.model_name}")
-
-    # Load data
-    train_pairs = get_video_and_csv_pairs("train", args.seq)
-    test_pairs = get_video_and_csv_pairs("test", args.seq)
-    logger.info("Total training pairs: %d", len(train_pairs))
-    logger.info("Total test pairs: %d", len(test_pairs))
-
-    if len(train_pairs) == 0:
-        logger.error("No training data found.")
-        raise ValueError("No training data found.")
-
-    # Initialize multiprocessing
-    manager = Manager()
-    shared_weights = manager.dict()
-    barrier = Barrier(2)  # Barrier for 2 processes
-    processes = []
-
-    # Start two processes
-    for process_id in range(2):
-        p = mp.Process(
-            target=train_process,
-            args=(process_id, args, train_pairs, test_pairs, shared_weights, barrier),
+    for frames, heatmaps in train_dataset.take(1):
+        logger.info("Frames shape: %s", frames.shape)
+        logger.info("Heatmaps shape: %s", heatmaps.shape)
+        frames = tf.transpose(frames[0], [1, 2, 0])
+        heatmaps = tf.transpose(heatmaps[0], [1, 2, 0])
+        if args.grayscale:
+            tf.io.write_file(
+                "augmented_frame.png",
+                tf.image.encode_png(
+                    tf.cast(tf.image.grayscale_to_rgb(frames[:, :, :1]) * 255, tf.uint8)
+                ),
+            )
+        else:
+            tf.io.write_file(
+                "augmented_frame.png",
+                tf.image.encode_png(tf.cast(frames[:, :, :3] * 255, tf.uint8)),
+            )
+        tf.io.write_file(
+            "augmented_heatmap.png",
+            tf.image.encode_png(tf.cast(heatmaps[:, :, 0:1] * 255, tf.uint8)),
         )
-        processes.append(p)
-        p.start()
-
-    # Wait for processes to complete
-    for p in processes:
-        p.join()
-
-    logger.info("Parallel training completed")
+    logger.info("Starting training...")
+    model.fit(
+        train_dataset,
+        validation_data=test_dataset,
+        epochs=args.epochs,
+        initial_epoch=initial_epoch,
+        callbacks=callbacks,
+    )
+    logger.info("Training completed")
 
 
 if __name__ == "__main__":

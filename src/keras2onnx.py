@@ -3,7 +3,7 @@ import tensorflow as tf
 import tf2onnx
 import onnx
 from model.VballNetV1 import MotionPromptLayer, FusionLayerTypeA
-from model.VballNetV2b import spatial_attention, DyT
+#from model.VballNetV2b import spatial_attention, DyT
 from utils import custom_loss
 
 # Parse command-line arguments
