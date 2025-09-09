@@ -51,35 +51,35 @@ class MemoryEfficientDataset:
     Класс для эффективной по памяти загрузки датасета.
     Реализует подход с предзагрузкой в uint8 формате по образцу grayscale примера.
     """
-    
+
     def __init__(self, data_path, seq=3, grayscale=False, preload_memory=False):
         self.data_path = Path(data_path)
         self.seq = seq
         self.grayscale = grayscale
         self.preload_memory = preload_memory
-        
+
         # Списки для хранения индексов и кеша
         self.sequence_indices = []
         self.image_cache = []
-        
+
         if self.preload_memory:
             self._load_dataset()
         else:
             self._build_sequence_indices()
-    
+
     def _build_sequence_indices(self):
         """Построить список индексов последовательностей без предзагрузки."""
         matches = [
             d for d in os.listdir(self.data_path)
             if os.path.isdir(self.data_path / d) and d.startswith("match")
         ]
-        
+
         for match in matches:
             inputs_path = self.data_path / match / "inputs"
             heatmaps_path = self.data_path / match / "heatmaps"
             if not (inputs_path.exists() and heatmaps_path.exists()):
                 continue
-                
+
             rallies = [d for d in os.listdir(inputs_path) if os.path.isdir(inputs_path / d)]
             for rally in rallies:
                 input_rally_path = inputs_path / rally
@@ -87,29 +87,29 @@ class MemoryEfficientDataset:
                     [f for f in os.listdir(input_rally_path) if f.endswith(".jpg")],
                     key=lambda x: int(x.split(".")[0]),
                 )
-                
+
                 # Создать индексы для всех последовательностей
                 for i in range(len(frames) - self.seq + 1):
                     self.sequence_indices.append((match, rally, i))
-    
+
     def _load_dataset(self):
         """
         Загрузить и кешировать все изображения и тепловые карты в ОЗУ.
         Оптимизировано по образцу grayscale примера.
         """
         print(f"Загрузка датасета из {self.data_path} в ОЗУ...")
-        
+
         matches = [
             d for d in os.listdir(self.data_path)
             if os.path.isdir(self.data_path / d) and d.startswith("match")
         ]
-        
+
         for match in tqdm(matches, desc="Кеширование матчей"):
             inputs_path = self.data_path / match / "inputs"
             heatmaps_path = self.data_path / match / "heatmaps"
             if not (inputs_path.exists() and heatmaps_path.exists()):
                 continue
-                
+
             rallies = [d for d in os.listdir(inputs_path) if os.path.isdir(inputs_path / d)]
             for rally in rallies:
                 input_rally_path = inputs_path / rally
@@ -118,13 +118,13 @@ class MemoryEfficientDataset:
                     [f for f in os.listdir(input_rally_path) if f.endswith(".jpg")],
                     key=lambda x: int(x.split(".")[0]),
                 )
-                
+
                 # Загрузить все кадры и тепловые карты для этого розыгрыша в ОЗУ
                 rally_images = []
                 for frame in frames:
                     img_path = input_rally_path / frame
                     heatmap_path = heatmap_rally_path / frame
-                    
+
                     # Загрузить изображение
                     img = cv2.imread(
                         str(img_path),
@@ -136,63 +136,63 @@ class MemoryEfficientDataset:
                         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                     else:
                         img = np.expand_dims(img, axis=-1)
-                    
+
                     # Использовать uint8 для экономии памяти
                     img = img.astype(np.uint8)
-                    
+
                     # Загрузить тепловую карту
                     heatmap = cv2.imread(str(heatmap_path), cv2.IMREAD_GRAYSCALE)
                     if heatmap is None:
                         continue
                     heatmap = heatmap.astype(np.uint8)
-                    
+
                     rally_images.append((img, heatmap))
-                
+
                 # Кешировать допустимые последовательности
                 for i in range(len(frames) - self.seq + 1):
                     self.sequence_indices.append((match, rally, i))
                 self.image_cache.extend(rally_images)
-        
+
         print(
             f"Кешировано {len(self.image_cache)} кадров и {len(self.sequence_indices)} последовательностей в ОЗУ."
         )
-        
+
         # Подсчитать использование памяти
         if self.image_cache:
             total_size = sum(img.nbytes + hm.nbytes for img, hm in self.image_cache)
             total_mb = total_size / (1024 * 1024)
             print(f"Общее использование памяти (uint8): {total_mb:.2f} MB")
-    
+
     def __len__(self):
         return len(self.sequence_indices)
-    
+
     def __getitem__(self, idx):
         """Получить последовательность по индексу."""
         if self.preload_memory:
             return self._get_preloaded_item(idx)
         else:
             return self._get_disk_item(idx)
-    
+
     def _get_preloaded_item(self, idx):
         """Получить последовательность из предзагруженных данных."""
         match, rally, frame_start = self.sequence_indices[idx]
-        
+
         # Получить последовательность кадров из кеша
         frames = []
         heatmaps = []
-        
+
         cache_offset = self._get_cache_offset(match, rally)
         for i in range(self.seq):
             img, heatmap = self.image_cache[cache_offset + frame_start + i]
             frames.append(img)
             heatmaps.append(heatmap)
-        
+
         # Объединить и нормализовать
         frames_concat = np.concatenate(frames, axis=2).astype(np.float32) / 255.0
         heatmaps_concat = np.stack(heatmaps, axis=2).astype(np.float32) / 255.0
-        
+
         return frames_concat, heatmaps_concat
-    
+
     def _get_cache_offset(self, match, rally):
         """Получить смещение в кеше для указанного матча и розыгрыша."""
         # Упрощенная реализация - в реальности нужно сохранять смещения
@@ -202,26 +202,26 @@ class MemoryEfficientDataset:
                 return offset
             # Приблизительно - в действительности нужно точно отслеживать
         return 0
-    
+
     def _get_disk_item(self, idx):
         """Получить последовательность с диска."""
         match, rally, frame_start = self.sequence_indices[idx]
-        
+
         inputs_path = self.data_path / match / "inputs" / rally
         heatmaps_path = self.data_path / match / "heatmaps" / rally
-        
+
         frames = sorted(
             [f for f in os.listdir(inputs_path) if f.endswith(".jpg")],
             key=lambda x: int(x.split(".")[0]),
         )
-        
+
         # Загрузить последовательность
         frame_data = []
         heatmap_data = []
-        
+
         for i in range(self.seq):
             frame_file = frames[frame_start + i]
-            
+
             # Загрузить кадр
             img = cv2.imread(
                 str(inputs_path / frame_file),
@@ -232,15 +232,15 @@ class MemoryEfficientDataset:
             else:
                 img = np.expand_dims(img, axis=-1)
             frame_data.append(img.astype(np.float32) / 255.0)
-            
+
             # Загрузить тепловую карту
             heatmap = cv2.imread(str(heatmaps_path / frame_file), cv2.IMREAD_GRAYSCALE)
             heatmap_data.append(heatmap.astype(np.float32) / 255.0)
-        
+
         # Объединить
         frames_concat = np.concatenate(frame_data, axis=2)
         heatmaps_concat = np.stack(heatmap_data, axis=2)
-        
+
         return frames_concat, heatmaps_concat
 
 
@@ -261,11 +261,11 @@ def get_model(model_name, height, width, seq, grayscale=False):
     if model_name == "TrackNetV4":
         from model.TrackNetV4 import TrackNetV4
         return TrackNetV4(height, width, "TypeB")
-        
+
     logger.info(
         f"Creating model {model_name} with height={height}, width={width}, in_dim={in_dim}, out_dim={out_dim}, seq={seq}, grayscale={grayscale}"
     )
-    
+
     if model_name == "VballNetV2b":
         from model.VballNetV2b import VballNetV2b
         return VballNetV2b(height, width, in_dim=in_dim, out_dim=out_dim)
@@ -275,15 +275,15 @@ def get_model(model_name, height, width, seq, grayscale=False):
     if model_name == "VballNetV3":
         from model.VballNetV3 import VballNetV3
         return VballNetV3(height, width, in_dim=in_dim, out_dim=out_dim)
-    
+
     return VballNetV1(height, width, in_dim=in_dim, out_dim=out_dim)
 
 
 def get_preprocessed_data_pairs(dataset_root, mode, seq):
     """
-    Получить пары (sequence_name, inputs_dir, heatmaps_dir, frame_indices) 
+    Получить пары (sequence_name, inputs_dir, heatmaps_dir, frame_indices)
     для предварительно обработанных данных.
-    
+
     Ожидаемая структура:
     dataset_preprocessed/
     ├── match1/
@@ -293,73 +293,73 @@ def get_preprocessed_data_pairs(dataset_root, mode, seq):
     """
     logger = logging.getLogger(__name__)
     pairs = []
-    
+    dataset_root = os.path.join(dataset_root, mode)
     if not os.path.exists(dataset_root):
         logger.warning("Dataset root %s does not exist", dataset_root)
         return pairs
-    
+
     # Поиск match директорий
     match_dirs = [
-        d for d in os.listdir(dataset_root) 
+        d for d in os.listdir(dataset_root)
         if d.startswith("match") and os.path.isdir(os.path.join(dataset_root, d))
     ]
-    
+
     for match_dir in match_dirs:
         match_path = os.path.join(dataset_root, match_dir)
         inputs_base_dir = os.path.join(match_path, "inputs")
         heatmaps_base_dir = os.path.join(match_path, "heatmaps")
-        
+
         if not os.path.exists(inputs_base_dir) or not os.path.exists(heatmaps_base_dir):
             logger.warning("Missing inputs or heatmaps directory in %s", match_path)
             continue
-            
+
         # Поиск rally директорий
         rally_dirs = [
             d for d in os.listdir(inputs_base_dir)
             if os.path.isdir(os.path.join(inputs_base_dir, d))
         ]
-        
+
         for rally_dir in rally_dirs:
             inputs_dir = os.path.join(inputs_base_dir, rally_dir)
             heatmaps_dir = os.path.join(heatmaps_base_dir, rally_dir)
-            
+
             if not os.path.exists(heatmaps_dir):
                 logger.warning("Missing heatmaps directory %s", heatmaps_dir)
                 continue
-                
+
             # Получить список доступных кадров
             input_files = [
-                f for f in os.listdir(inputs_dir) 
+                f for f in os.listdir(inputs_dir)
                 if f.endswith('.jpg') and f.replace('.jpg', '').isdigit()
             ]
             heatmap_files = [
                 f for f in os.listdir(heatmaps_dir)
                 if f.endswith('.jpg') and f.replace('.jpg', '').isdigit()
             ]
-            
+
             # Получить номера кадров
             input_frames = set(int(f.replace('.jpg', '')) for f in input_files)
             heatmap_frames = set(int(f.replace('.jpg', '')) for f in heatmap_files)
-            
+
             # Пересечение доступных кадров
             available_frames = sorted(input_frames.intersection(heatmap_frames))
-            
+
             if len(available_frames) < seq:
                 logger.warning(
                     "Sequence %s has only %d frames, need at least %d",
                     rally_dir, len(available_frames), seq
                 )
                 continue
-                
+
             # Создать последовательности кадров
             for i in range(len(available_frames) - seq + 1):
                 frame_indices = available_frames[i:i + seq]
-                
+
                 # Проверить, что индексы последовательны (optional, зависит от требований)
                 if max(frame_indices) - min(frame_indices) == seq - 1:
                     sequence_name = f"{match_dir}_{rally_dir}_{frame_indices[0]}"
                     pairs.append((sequence_name, inputs_dir, heatmaps_dir, frame_indices))
-    
+
     logger.info("Found %d valid preprocessed sequences for mode %s", len(pairs), mode)
     return pairs
 
@@ -371,14 +371,14 @@ def load_preprocessed_frames(inputs_dir, frame_indices, grayscale=False):
     """
     logger = logging.getLogger(__name__)
     frames = []
-    
+
     for frame_idx in frame_indices:
         frame_path = os.path.join(inputs_dir, f"{frame_idx}.jpg")
-        
+
         if not os.path.exists(frame_path):
             logger.error("Frame file does not exist: %s", frame_path)
             raise FileNotFoundError(f"Frame file does not exist: {frame_path}")
-            
+
         # Загружаем в grayscale или цветном режиме для экономии памяти
         frame = cv2.imread(
             frame_path,
@@ -387,19 +387,19 @@ def load_preprocessed_frames(inputs_dir, frame_indices, grayscale=False):
         if frame is None:
             logger.error("Failed to load frame: %s", frame_path)
             raise ValueError(f"Failed to load frame: {frame_path}")
-            
+
         if not grayscale:
             # Конвертировать BGR в RGB
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         else:
             frame = np.expand_dims(frame, axis=-1)
-            
+
         # Сохраняем как uint8 для экономии памяти
         frame = frame.astype(np.uint8)
         frames.append(frame)
-        
+
         logger.debug("Loaded frame %s with shape %s (uint8)", frame_path, frame.shape)
-    
+
     # Объединить кадры по каналам
     try:
         concatenated = np.concatenate(frames, axis=2)
@@ -417,26 +417,26 @@ def load_preprocessed_heatmaps(heatmaps_dir, frame_indices):
     """
     logger = logging.getLogger(__name__)
     heatmaps = []
-    
+
     for frame_idx in frame_indices:
         heatmap_path = os.path.join(heatmaps_dir, f"{frame_idx}.jpg")
-        
+
         if not os.path.exists(heatmap_path):
             logger.error("Heatmap file does not exist: %s", heatmap_path)
             raise FileNotFoundError(f"Heatmap file does not exist: {heatmap_path}")
-            
+
         heatmap = cv2.imread(heatmap_path, cv2.IMREAD_GRAYSCALE)
         if heatmap is None:
             logger.error("Failed to load heatmap: %s", heatmap_path)
             raise ValueError(f"Failed to load heatmap: {heatmap_path}")
-            
+
         # Сохраняем как uint8 для экономии памяти
         heatmap = heatmap.astype(np.uint8)
         heatmap = np.expand_dims(heatmap, axis=-1)
         heatmaps.append(heatmap)
-        
+
         logger.debug("Loaded heatmap %s with shape %s (uint8)", heatmap_path, heatmap.shape)
-    
+
     # Объединить тепловые карты по каналам
     try:
         concatenated = np.concatenate(heatmaps, axis=2)
@@ -453,7 +453,7 @@ def load_preprocessed_data(sequence_name, inputs_dir, heatmaps_dir, frame_indice
     Оптимизировано для экономии памяти.
     """
     logger = logging.getLogger(__name__)
-    
+
     # Обработка tensor inputs для tf.py_function
     if isinstance(sequence_name, tf.Tensor):
         sequence_name = sequence_name.numpy().decode('utf-8')
@@ -463,28 +463,28 @@ def load_preprocessed_data(sequence_name, inputs_dir, heatmaps_dir, frame_indice
         heatmaps_dir = heatmaps_dir.numpy().decode('utf-8')
     if isinstance(frame_indices, tf.Tensor):
         frame_indices = frame_indices.numpy().tolist()
-        
+
     # Загружаем данные в uint8 формате
     frames = load_preprocessed_frames(inputs_dir, frame_indices, grayscale)
     heatmaps = load_preprocessed_heatmaps(heatmaps_dir, frame_indices)
-    
+
     # Преобразуем в float32 и нормализуем
     frames = frames.astype(np.float32) / 255.0
     heatmaps = heatmaps.astype(np.float32) / 255.0
-    
+
     # Преобразуем в TensorFlow тензоры
     frames = tf.convert_to_tensor(frames, dtype=tf.float32)
     heatmaps = tf.convert_to_tensor(heatmaps, dtype=tf.float32)
-    
+
     # Установить форму тензоров
     frames.set_shape([IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)])
     heatmaps.set_shape([IMG_HEIGHT, IMG_WIDTH, seq])
-    
+
     logger.debug(
         "Loaded preprocessed data for %s: frames shape %s, heatmaps shape %s",
         sequence_name, frames.shape, heatmaps.shape
     )
-    
+
     return frames, heatmaps
 
 
@@ -496,41 +496,41 @@ def preload_dataset_to_memory(pairs, seq, grayscale=False):
     """
     logger = logging.getLogger(__name__)
     logger.info("Предзагрузка датасета в память для ускорения обучения...")
-    
+
     preloaded_frames = []
     preloaded_heatmaps = []
-    
+
     for i, (sequence_name, inputs_dir, heatmaps_dir, frame_indices) in enumerate(pairs):
         if i % 100 == 0:
             logger.info(f"Предзагружено {i}/{len(pairs)} последовательностей")
-            
+
         try:
             # Загружаем в uint8 формате для экономии памяти
             frames = load_preprocessed_frames(inputs_dir, frame_indices, grayscale)
             heatmaps = load_preprocessed_heatmaps(heatmaps_dir, frame_indices)
-            
+
             # Сохраняем как uint8 напрямую в numpy массивы
             preloaded_frames.append(frames)  # уже uint8
             preloaded_heatmaps.append(heatmaps)  # уже uint8
-            
+
         except Exception as e:
             logger.error(f"Ошибка при предзагрузке последовательности {sequence_name}: {e}")
             continue
-    
+
     logger.info(f"Успешно предзагружено {len(preloaded_frames)} последовательностей в память")
-    
+
     # Подсчет использования памяти (для uint8)
     total_memory_mb = 0
     if preloaded_frames:
         frames_memory = len(preloaded_frames) * preloaded_frames[0].nbytes / (1024 * 1024)
         heatmaps_memory = len(preloaded_heatmaps) * preloaded_heatmaps[0].nbytes / (1024 * 1024)
         total_memory_mb = frames_memory + heatmaps_memory
-        
+
         logger.info(f"Использование памяти датасетом: {total_memory_mb:.2f} MB")
         logger.info(f"  - Кадры: {frames_memory:.2f} MB (uint8)")
         logger.info(f"  - Тепловые карты: {heatmaps_memory:.2f} MB (uint8)")
         logger.info(f"  - Экономия памяти: ~{total_memory_mb * 3:.2f} MB (по сравнению с float32)")
-    
+
     return preloaded_frames, preloaded_heatmaps
 
 
@@ -539,7 +539,7 @@ def create_tf_dataset_from_memory_efficient(dataset, batch_size, seq, grayscale=
     Создать TensorFlow Dataset из меморийно-эффективного класса.
     """
     logger = logging.getLogger(__name__)
-    
+
     def generator():
         indices = list(range(len(dataset)))
         if shuffle:
@@ -547,18 +547,18 @@ def create_tf_dataset_from_memory_efficient(dataset, batch_size, seq, grayscale=
         for idx in indices:
             frames, heatmaps = dataset[idx]
             yield frames, heatmaps
-    
+
     # Определить формы выходных тензоров
     output_signature = (
         tf.TensorSpec(shape=[IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)], dtype=tf.float32),
         tf.TensorSpec(shape=[IMG_HEIGHT, IMG_WIDTH, seq], dtype=tf.float32)
     )
-    
+
     tf_dataset = tf.data.Dataset.from_generator(
         generator,
         output_signature=output_signature
     )
-    
+
     if augment:
         tf_dataset = tf_dataset.map(
             lambda frames, heatmaps: reshape_tensors(frames, heatmaps, seq, grayscale),
@@ -572,17 +572,17 @@ def create_tf_dataset_from_memory_efficient(dataset, batch_size, seq, grayscale=
             lambda frames, heatmaps: reshape_tensors(frames, heatmaps, seq, grayscale),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
-    
+
     tf_dataset = tf_dataset.batch(batch_size)
-    
+
     if alpha > 0 and augment:
         tf_dataset = tf_dataset.map(
             lambda frames, heatmaps: mixup(frames, heatmaps, alpha),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
-    
+
     tf_dataset = tf_dataset.prefetch(tf.data.AUTOTUNE)
-    
+
     logger.info(f"Создан TF Dataset с {len(dataset)} последовательностями")
     return tf_dataset
 
@@ -594,19 +594,19 @@ def load_preloaded_data(index, preloaded_frames, preloaded_heatmaps, seq, graysc
     """
     if isinstance(index, tf.Tensor):
         index = index.numpy()
-        
+
     # Получаем uint8 данные и преобразуем в float32
     frames_uint8 = preloaded_frames[index]
     heatmaps_uint8 = preloaded_heatmaps[index]
-    
+
     # Нормализация в float32
     frames = tf.convert_to_tensor(frames_uint8.astype(np.float32) / 255.0, dtype=tf.float32)
     heatmaps = tf.convert_to_tensor(heatmaps_uint8.astype(np.float32) / 255.0, dtype=tf.float32)
-    
+
     # Установить форму тензоров
     frames.set_shape([IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)])
     heatmaps.set_shape([IMG_HEIGHT, IMG_WIDTH, seq])
-    
+
     return frames, heatmaps
 
 
@@ -619,11 +619,11 @@ def reshape_tensors(frames, heatmaps, seq, grayscale=False):
         frames, [IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)]
     )
     heatmaps = tf.ensure_shape(heatmaps, [IMG_HEIGHT, IMG_WIDTH, seq])
-    
+
     # Транспонировать к каналы-первые (N, C, H, W)
     frames = tf.transpose(frames, [2, 0, 1])
     heatmaps = tf.transpose(heatmaps, [2, 0, 1])
-    
+
     logger.debug(
         "Reshaped tensors: frames %s, heatmaps %s", frames.shape, heatmaps.shape
     )
@@ -641,11 +641,11 @@ def mixup(frames, heatmaps, alpha=0.5):
     lamb = gamma1 / (gamma1 + gamma2)
     lamb = tf.maximum(lamb, 1.0 - lamb)
     lamb = tf.reshape(lamb, [batch_size, 1, 1, 1])
-    
+
     indices = tf.random.shuffle(tf.range(batch_size))
     frames_mixed = frames * lamb + tf.gather(frames, indices) * (1.0 - lamb)
     heatmaps_mixed = heatmaps * lamb + tf.gather(heatmaps, indices) * (1.0 - lamb)
-    
+
     logger.debug(
         "Applied mixup: frames_mixed shape %s, heatmaps_mixed shape %s",
         frames_mixed.shape, heatmaps_mixed.shape
@@ -673,40 +673,40 @@ def augment_sequence(frames, heatmaps, seq, grayscale=False, alpha=-1.0):
         tf.debugging.assert_less_equal(
             heatmaps, 1.0, message="Heatmaps contain values > 1"
         )
-        
+
         logger.debug(
             "Input shapes: frames %s, heatmaps %s", frames.shape, heatmaps.shape
         )
-        
+
         # Транспонировать для применения аугментаций
         frames = tf.transpose(frames, [1, 2, 0])
         heatmaps = tf.transpose(heatmaps, [1, 2, 0])
-        
+
         # Объединить для синхронных аугментаций
         combined = tf.concat([frames, heatmaps], axis=2)
-        
+
         # Применить случайное отражение
         combined = tf.image.random_flip_left_right(combined, seed=None)
-        
+
         logger.debug("After flip: combined shape %s", combined.shape)
-        
+
         # Разделить обратно
         frames = combined[:, :, :seq * (1 if grayscale else 3)]
         heatmaps = combined[:, :, seq * (1 if grayscale else 3):]
-        
+
         # Транспонировать обратно
         frames = tf.transpose(frames, [2, 0, 1])
         heatmaps = tf.transpose(heatmaps, [2, 0, 1])
-        
+
         frames = tf.ensure_shape(frames, [seq * (1 if grayscale else 3), 288, 512])
         heatmaps = tf.ensure_shape(heatmaps, [seq, 288, 512])
-        
+
         logger.debug(
             "After geometric augmentations: frames %s, heatmaps %s",
             frames.shape, heatmaps.shape
         )
         return frames, heatmaps
-        
+
     except Exception as e:
         logger.error("Error in augment_sequence: %s", str(e))
         logger.error("Frames shape: %s", frames.shape if frames is not None else "None")
@@ -817,22 +817,22 @@ def main():
         "Starting training script for preprocessed data with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s gpu_memory_limit=%d preload_memory=%s use_memory_efficient=%s",
         args.seq, args.grayscale, args.debug, args.resume, args.model_name, args.alpha, args.gpu_memory_limit, args.preload_memory, args.use_memory_efficient
     )
-    
+
     limit_gpu_memory(args.gpu_memory_limit)
-    
+
     if args.seq < 1:
         logger.error("Sequence length must be at least 1, got %d", args.seq)
         raise ValueError(f"Invalid sequence length: {args.seq}")
-        
+
     if args.model_name not in [
-        "VballNetFastV1", "VballNetV1", "VballNetV2", "VballNetV2b", 
+        "VballNetFastV1", "VballNetV1", "VballNetV2", "VballNetV2b",
         "VballNetV3", "PlayerNetFastV1", "TrackNetV4"
     ]:
         logger.error(
             "Invalid model name: %s. Must be one of supported models", args.model_name
         )
         raise ValueError(f"Invalid model name: {args.model_name}")
-    
+
     # Настроить имена и директории модели
     model_name_suffix = (
         f"_seq{args.seq}_grayscale" if args.grayscale and args.seq == 9 else ""
@@ -841,29 +841,29 @@ def main():
     model_save_dir = os.path.join(MODEL_DIR, model_save_name)
     os.makedirs(model_save_dir, exist_ok=True)
     logger.info("Created model save directory: %s", model_save_dir)
-    
+
     # Получить пары данных
     if args.use_memory_efficient:
         # Использовать новый memory-efficient подход
         logger.info("Используется memory-efficient подход с оптимизацией uint8...")
-        
+
         train_dataset_me = MemoryEfficientDataset(
-            args.dataset_root, 
-            seq=args.seq, 
-            grayscale=args.grayscale, 
+            args.dataset_root,
+            seq=args.seq,
+            grayscale=args.grayscale,
             preload_memory=args.preload_memory
         )
-        
+
         # Создать тестовый датасет (используем 10% от обучающего)
         test_size = max(1, len(train_dataset_me) // 10)
         test_indices = np.random.choice(len(train_dataset_me), test_size, replace=False)
-        
+
         # Создать TensorFlow датасеты
         train_dataset = create_tf_dataset_from_memory_efficient(
-            train_dataset_me, BATCH_SIZE, args.seq, args.grayscale, 
+            train_dataset_me, BATCH_SIZE, args.seq, args.grayscale,
             shuffle=True, augment=True, alpha=args.alpha
         )
-        
+
         # Для тестового датасета используем подмножество без аугментации
         class SubsetDataset:
             def __init__(self, original_dataset, indices):
@@ -873,36 +873,36 @@ def main():
                 return len(self.indices)
             def __getitem__(self, idx):
                 return self.original_dataset[self.indices[idx]]
-        
+
         test_dataset_me = SubsetDataset(train_dataset_me, test_indices)
         test_dataset = create_tf_dataset_from_memory_efficient(
-            test_dataset_me, BATCH_SIZE, args.seq, args.grayscale, 
+            test_dataset_me, BATCH_SIZE, args.seq, args.grayscale,
             shuffle=False, augment=False
         )
-        
+
         logger.info(f"Memory-efficient датасеты: train={len(train_dataset_me)}, test={len(test_dataset_me)}")
-        
+
     else:
         # Использовать оригинальный подход
         train_pairs = get_preprocessed_data_pairs(args.dataset_root, "train_preprocessed", args.seq)
         test_pairs = get_preprocessed_data_pairs(args.dataset_root, "test", args.seq)
         logger.info("Number of training pairs: %d", len(train_pairs))
         logger.info("Number of test pairs: %d", len(test_pairs))
-        
+
         if len(train_pairs) == 0:
             logger.error("No training data found. Check dataset_root and preprocessed structure.")
             raise ValueError("No training data found. Check dataset_root and preprocessed structure.")
-            
+
         if len(test_pairs) == 0:
             logger.warning("No test data found. Will use training data for validation.")
             test_pairs = train_pairs[:max(1, len(train_pairs) // 10)]  # Use 10% of training data
-        
+
         # Предзагрузка датасета в память (опционально)
         if args.preload_memory:
             logger.info("Preloading datasets to memory...")
             train_frames_mem, train_heatmaps_mem = preload_dataset_to_memory(train_pairs, args.seq, args.grayscale)
             test_frames_mem, test_heatmaps_mem = preload_dataset_to_memory(test_pairs, args.seq, args.grayscale)
-            
+
             # Создать датасеты из предзагруженных данных
             train_dataset = (
                 tf.data.Dataset.from_tensor_slices(list(range(len(train_pairs))))
@@ -930,7 +930,7 @@ def main():
                 )
                 .batch(BATCH_SIZE)
             )
-            
+
             test_dataset = (
                 tf.data.Dataset.from_tensor_slices(list(range(len(test_pairs))))
                 .map(
@@ -952,7 +952,7 @@ def main():
                 .batch(BATCH_SIZE)
                 .prefetch(tf.data.AUTOTUNE)
             )
-            
+
         else:
             # Обычная загрузка с диска
             train_dataset = (
@@ -986,7 +986,7 @@ def main():
                 )
                 .batch(BATCH_SIZE)
             )
-            
+
             test_dataset = (
                 tf.data.Dataset.from_tensor_slices((
                     [p[0] for p in test_pairs],
@@ -1013,25 +1013,25 @@ def main():
                 .batch(BATCH_SIZE)
                 .prefetch(tf.data.AUTOTUNE)
             )
-    
+
     # Применить mixup аугментацию к training dataset
     if args.alpha > 0:
         train_dataset = train_dataset.map(
             lambda frames, heatmaps: mixup(frames, heatmaps, args.alpha),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
-    
+
     # Добавить prefetch для training dataset
     if args.preload_memory:
         train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
     else:
         train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
-    
+
     train_size = tf.data.experimental.cardinality(train_dataset).numpy()
     test_size = tf.data.experimental.cardinality(test_dataset).numpy()
     logger.info("Number of training batches: %d", train_size)
     logger.info("Number of test batches: %d", test_size)
-    
+
     # Создать модель
     model = get_model(
         args.model_name,
@@ -1041,13 +1041,13 @@ def main():
         grayscale=args.grayscale,
     )
     model.summary(print_fn=lambda x: logger.info(x))
-    
+
     # Настройки обучения
     initial_epoch = 0
     initial_learning_rate = 1e-3
     decay_steps = train_size * 2
     decay_rate = 0.9
-    
+
     if args.resume:
         # Проверить наличие последней контрольной точки
         latest_checkpoint = os.path.join(model_save_dir, f"{model_save_name}_latest.keras")
@@ -1056,7 +1056,7 @@ def main():
             model = tf.keras.models.load_model(
                 latest_checkpoint, custom_objects={"custom_loss": custom_loss}
             )
-            
+
             # Извлечь эпоху из файлов контрольных точек
             checkpoint_files = glob.glob(
                 os.path.join(model_save_dir, f"{model_save_name}/{model_save_name}_*.keras")
@@ -1071,7 +1071,7 @@ def main():
                 initial_epoch = int(epoch_str) if epoch_str.isdigit() else 0
             else:
                 initial_epoch = 0
-                
+
             # Загрузить параметры графика скорости обучения
             lr_params = load_lr_schedule_params(model_save_dir)
             if lr_params:
@@ -1085,7 +1085,7 @@ def main():
                 "No latest checkpoint found for %s in %s, starting training from scratch.",
                 model_save_name, model_save_dir
             )
-    
+
     # Настроить оптимизатор и компиляцию
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
         initial_learning_rate=initial_learning_rate,
@@ -1094,21 +1094,21 @@ def main():
     )
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     model.compile(optimizer=optimizer, loss=custom_loss, metrics=["mae"])
-    
+
     logger.info(
         "Model compiled with optimizer=Adam(lr_schedule), loss=custom_loss, metrics=['mae']"
     )
-    
+
     # Пути для сохранения контрольных точек
     latest_checkpoint_path = os.path.join(model_save_dir, f"{model_save_name}_latest.keras")
     best_checkpoint_path = os.path.join(model_save_dir, f"{model_save_name}_best.keras")
     epoch_checkpoint_path = os.path.join(
         model_save_dir, f"{model_save_name}/{model_save_name}_{{epoch:02d}}.keras"
     )
-    
+
     # Сохранить параметры графика скорости обучения
     save_lr_schedule_params(model_save_dir, initial_learning_rate, decay_steps, decay_rate)
-    
+
     class LearningRateLogger(tf.keras.callbacks.Callback):
         def __init__(self, lr_schedule, train_size):
             super().__init__()
@@ -1157,20 +1157,26 @@ def main():
             log_dir=os.path.join(MODEL_DIR, "logs", f"{model_save_name}/outcome"),
         ),
         LearningRateLogger(lr_schedule, train_size),
+        VisualizationCallback(
+            test_dataset=test_dataset,
+            save_dir=os.path.join(MODEL_DIR, "visualizations"),
+            seq=args.seq,
+            grayscale=args.grayscale,
+        ),
     ]
-    
+
     logger.info(
         "Callbacks configured: ModelCheckpoint (latest, best, epoch), TensorBoard, EarlyStopping, OutcomeMetricsCallback, LearningRateLogger"
     )
-    
+
     # Сохранить пример аугментированных данных
     for frames, heatmaps in train_dataset.take(1):
         logger.info("Sample batch - Frames shape: %s", frames.shape)
         logger.info("Sample batch - Heatmaps shape: %s", heatmaps.shape)
-        
+
         frames_sample = tf.transpose(frames[0], [1, 2, 0])
         heatmaps_sample = tf.transpose(heatmaps[0], [1, 2, 0])
-        
+
         if args.grayscale:
             tf.io.write_file(
                 "augmented_frame_preprocessed.png",
@@ -1188,7 +1194,7 @@ def main():
             tf.image.encode_png(tf.cast(heatmaps_sample[:, :, 0:1] * 255, tf.uint8)),
         )
         break
-    
+
     logger.info("Starting training...")
     model.fit(
         train_dataset,

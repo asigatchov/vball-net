@@ -440,11 +440,32 @@ class VisualizationCallback(tf.keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
         logger = logging.getLogger(__name__)
         for frames, heatmaps in self.test_dataset.shuffle(self.buffer_size):
-            frames = tf.transpose(frames, [0, 2, 3, 1])
-            pred_heatmaps = self.model.predict(frames, verbose=0)
+            # Определяем формат входа модели
+            input_shape = self.model.input_shape
+            # input_shape: (None, C, H, W) или (None, H, W, C)
+            if len(input_shape) == 4:
+                if input_shape[1] == 288 or input_shape[1] == 512:
+                    # channels_last
+                    frames_for_pred = tf.transpose(frames, [0, 2, 3, 1])
+                else:
+                    # channels_first
+                    frames_for_pred = frames
+            else:
+                frames_for_pred = frames
+
+            pred_heatmaps = self.model.predict(frames_for_pred, verbose=0)
             frames_np = frames[0].numpy()
             heatmaps_np = heatmaps[0].numpy()
             pred_heatmaps_np = pred_heatmaps[0]
+
+            # Транспонируем frames_np в [H, W, C] если channels_first
+            if frames_np.shape[0] == self.seq * (1 if self.grayscale else 3):
+                frames_np = np.transpose(frames_np, (1, 2, 0))
+            # Аналогично для heatmaps_np
+            if heatmaps_np.shape[0] == self.seq:
+                heatmaps_np = np.transpose(heatmaps_np, (1, 2, 0))
+            if pred_heatmaps_np.shape[0] == self.seq:
+                pred_heatmaps_np = np.transpose(pred_heatmaps_np, (1, 2, 0))
 
             for i in range(self.seq):
                 if self.grayscale:
@@ -458,8 +479,8 @@ class VisualizationCallback(tf.keras.callbacks.Callback):
                     frame = tf.ensure_shape(frame, [288, 512, 3])
 
                 try:
-                    true_heatmap = heatmaps_np[i, :, :]
-                    pred_heatmap = pred_heatmaps_np[i, :, :]
+                    true_heatmap = heatmaps_np[:, :, i]
+                    pred_heatmap = pred_heatmaps_np[:, :, i]
                     frame = tf.cast(frame * 255, tf.uint8)
                     true_heatmap = tf.cast(true_heatmap * 255, tf.uint8)
                     pred_heatmap = tf.cast(pred_heatmap * 255, tf.uint8)
