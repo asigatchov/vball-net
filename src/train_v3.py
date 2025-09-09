@@ -94,7 +94,7 @@ def get_preprocessed_data_pairs(dataset_root, mode, seq):
     """
     logger = logging.getLogger(__name__)
     pairs = []
-    dataset_root = os.path.join(dataset_root, mode) 
+    
     if not os.path.exists(dataset_root):
         logger.warning("Dataset root %s does not exist", dataset_root)
         return pairs
@@ -272,6 +272,67 @@ def load_preprocessed_data(sequence_name, inputs_dir, heatmaps_dir, frame_indice
     return frames, heatmaps
 
 
+def preload_dataset_to_memory(pairs, seq, grayscale=False):
+    """
+    Предварительная загрузка всего датасета в память для ускорения обучения.
+    Возвращает списки предзагруженных frames и heatmaps.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Preloading dataset to memory for faster training...")
+    
+    preloaded_frames = []
+    preloaded_heatmaps = []
+    
+    for i, (sequence_name, inputs_dir, heatmaps_dir, frame_indices) in enumerate(pairs):
+        if i % 100 == 0:
+            logger.info(f"Preloaded {i}/{len(pairs)} sequences")
+            
+        try:
+            frames = load_preprocessed_frames(inputs_dir, frame_indices, grayscale)
+            heatmaps = load_preprocessed_heatmaps(heatmaps_dir, frame_indices)
+            
+            # Преобразовать в numpy для экономии памяти
+            frames_np = frames.numpy()
+            heatmaps_np = heatmaps.numpy()
+            
+            preloaded_frames.append(frames_np)
+            preloaded_heatmaps.append(heatmaps_np)
+            
+        except Exception as e:
+            logger.error(f"Failed to preload sequence {sequence_name}: {e}")
+            continue
+    
+    logger.info(f"Successfully preloaded {len(preloaded_frames)} sequences to memory")
+    
+    # Подсчет использования памяти
+    total_memory_mb = 0
+    if preloaded_frames:
+        frames_memory = len(preloaded_frames) * preloaded_frames[0].nbytes / (1024 * 1024)
+        heatmaps_memory = len(preloaded_heatmaps) * preloaded_heatmaps[0].nbytes / (1024 * 1024)
+        total_memory_mb = frames_memory + heatmaps_memory
+        
+    logger.info(f"Dataset memory usage: {total_memory_mb:.2f} MB")
+    
+    return preloaded_frames, preloaded_heatmaps
+
+
+def load_preloaded_data(index, preloaded_frames, preloaded_heatmaps, seq, grayscale=False):
+    """
+    Загрузить данные из предзагруженного в память датасета по индексу.
+    """
+    if isinstance(index, tf.Tensor):
+        index = index.numpy()
+        
+    frames = tf.convert_to_tensor(preloaded_frames[index], dtype=tf.float32)
+    heatmaps = tf.convert_to_tensor(preloaded_heatmaps[index], dtype=tf.float32)
+    
+    # Установить форму тензоров
+    frames.set_shape([IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)])
+    heatmaps.set_shape([IMG_HEIGHT, IMG_WIDTH, seq])
+    
+    return frames, heatmaps
+
+
 def reshape_tensors(frames, heatmaps, seq, grayscale=False):
     """
     Изменить форму тензоров для соответствия ожидаемому формату модели.
@@ -418,8 +479,13 @@ def parser_args():
     parser.add_argument(
         "--dataset_root",
         type=str,
-        default="data",
+        default="dataset_preprocessed",
         help="Root directory of preprocessed dataset (default: dataset_preprocessed).",
+    )
+    parser.add_argument(
+        "--preload_memory",
+        action="store_true",
+        help="Preload entire dataset to memory for faster training (uses more RAM).",
     )
     parser.add_argument(
         "--resume",
@@ -466,8 +532,8 @@ def main():
     args = parser_args()
     logger = logging.getLogger(__name__)
     logger.info(
-        "Starting training script for preprocessed data with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s gpu_memory_limit=%d",
-        args.seq, args.grayscale, args.debug, args.resume, args.model_name, args.alpha, args.gpu_memory_limit
+        "Starting training script for preprocessed data with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s gpu_memory_limit=%d preload_memory=%s",
+        args.seq, args.grayscale, args.debug, args.resume, args.model_name, args.alpha, args.gpu_memory_limit, args.preload_memory
     )
     
     limit_gpu_memory(args.gpu_memory_limit)
@@ -496,8 +562,8 @@ def main():
     
     # Получить пары данных
     train_pairs = get_preprocessed_data_pairs(args.dataset_root, "train_preprocessed", args.seq)
-    test_pairs = get_preprocessed_data_pairs(args.dataset_root, "test_preprocessed", args.seq)
-
+    test_pairs = get_preprocessed_data_pairs(args.dataset_root, "test", args.seq)
+    
     logger.info("Number of training pairs: %d", len(train_pairs))
     logger.info("Number of test pairs: %d", len(test_pairs))
     
@@ -509,73 +575,135 @@ def main():
         logger.warning("No test data found. Will use training data for validation.")
         test_pairs = train_pairs[:max(1, len(train_pairs) // 10)]  # Use 10% of training data
     
-    # Создать датасеты
-    train_dataset = (
-        tf.data.Dataset.from_tensor_slices((
-            [p[0] for p in train_pairs],  # sequence_name
-            [p[1] for p in train_pairs],  # inputs_dir
-            [p[2] for p in train_pairs],  # heatmaps_dir
-            [p[3] for p in train_pairs],  # frame_indices
-        ))
-        .map(
-            lambda sn, id, hd, fi: tf.py_function(
-                func=lambda w, x, y, z: load_preprocessed_data(
-                    w, x, y, z, "train", args.seq, args.grayscale
+    # Предзагрузка датасета в память (опционально)
+    if args.preload_memory:
+        logger.info("Preloading datasets to memory...")
+        train_frames_mem, train_heatmaps_mem = preload_dataset_to_memory(train_pairs, args.seq, args.grayscale)
+        test_frames_mem, test_heatmaps_mem = preload_dataset_to_memory(test_pairs, args.seq, args.grayscale)
+        
+        # Создать датасеты из предзагруженных данных
+        train_dataset = (
+            tf.data.Dataset.from_tensor_slices(list(range(len(train_pairs))))
+            .map(
+                lambda idx: tf.py_function(
+                    func=lambda i: load_preloaded_data(
+                        i, train_frames_mem, train_heatmaps_mem, args.seq, args.grayscale
+                    ),
+                    inp=[idx],
+                    Tout=[tf.float32, tf.float32],
                 ),
-                inp=[sn, id, hd, fi],
-                Tout=[tf.float32, tf.float32],
-            ),
-            num_parallel_calls=tf.data.AUTOTUNE,
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .map(
+                lambda frames, heatmaps: reshape_tensors(
+                    frames, heatmaps, args.seq, args.grayscale
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .map(
+                lambda frames, heatmaps: augment_sequence(
+                    frames, heatmaps, args.seq, args.grayscale, args.alpha
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .batch(BATCH_SIZE)
         )
-        .map(
-            lambda frames, heatmaps: reshape_tensors(
-                frames, heatmaps, args.seq, args.grayscale
-            ),
-            num_parallel_calls=tf.data.AUTOTUNE,
+        
+        test_dataset = (
+            tf.data.Dataset.from_tensor_slices(list(range(len(test_pairs))))
+            .map(
+                lambda idx: tf.py_function(
+                    func=lambda i: load_preloaded_data(
+                        i, test_frames_mem, test_heatmaps_mem, args.seq, args.grayscale
+                    ),
+                    inp=[idx],
+                    Tout=[tf.float32, tf.float32],
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .map(
+                lambda frames, heatmaps: reshape_tensors(
+                    frames, heatmaps, args.seq, args.grayscale
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .batch(BATCH_SIZE)
+            .prefetch(tf.data.AUTOTUNE)
         )
-        .map(
-            lambda frames, heatmaps: augment_sequence(
-                frames, heatmaps, args.seq, args.grayscale, args.alpha
-            ),
-            num_parallel_calls=tf.data.AUTOTUNE,
+        
+    else:
+        # Обычная загрузка с диска
+        train_dataset = (
+            tf.data.Dataset.from_tensor_slices((
+                [p[0] for p in train_pairs],  # sequence_name
+                [p[1] for p in train_pairs],  # inputs_dir
+                [p[2] for p in train_pairs],  # heatmaps_dir
+                [p[3] for p in train_pairs],  # frame_indices
+            ))
+            .map(
+                lambda sn, id, hd, fi: tf.py_function(
+                    func=lambda w, x, y, z: load_preprocessed_data(
+                        w, x, y, z, "train", args.seq, args.grayscale
+                    ),
+                    inp=[sn, id, hd, fi],
+                    Tout=[tf.float32, tf.float32],
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .map(
+                lambda frames, heatmaps: reshape_tensors(
+                    frames, heatmaps, args.seq, args.grayscale
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .map(
+                lambda frames, heatmaps: augment_sequence(
+                    frames, heatmaps, args.seq, args.grayscale, args.alpha
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .batch(BATCH_SIZE)
         )
-        .batch(BATCH_SIZE)
-    )
+        
+        test_dataset = (
+            tf.data.Dataset.from_tensor_slices((
+                [p[0] for p in test_pairs],
+                [p[1] for p in test_pairs],
+                [p[2] for p in test_pairs],
+                [p[3] for p in test_pairs],
+            ))
+            .map(
+                lambda sn, id, hd, fi: tf.py_function(
+                    func=lambda w, x, y, z: load_preprocessed_data(
+                        w, x, y, z, "test", args.seq, args.grayscale
+                    ),
+                    inp=[sn, id, hd, fi],
+                    Tout=[tf.float32, tf.float32],
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .map(
+                lambda frames, heatmaps: reshape_tensors(
+                    frames, heatmaps, args.seq, args.grayscale
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .batch(BATCH_SIZE)
+            .prefetch(tf.data.AUTOTUNE)
+        )
     
+    # Применить mixup аугментацию к training dataset
     if args.alpha > 0:
         train_dataset = train_dataset.map(
             lambda frames, heatmaps: mixup(frames, heatmaps, args.alpha),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
     
-    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
-    
-    test_dataset = (
-        tf.data.Dataset.from_tensor_slices((
-            [p[0] for p in test_pairs],
-            [p[1] for p in test_pairs],
-            [p[2] for p in test_pairs],
-            [p[3] for p in test_pairs],
-        ))
-        .map(
-            lambda sn, id, hd, fi: tf.py_function(
-                func=lambda w, x, y, z: load_preprocessed_data(
-                    w, x, y, z, "test", args.seq, args.grayscale
-                ),
-                inp=[sn, id, hd, fi],
-                Tout=[tf.float32, tf.float32],
-            ),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-        .map(
-            lambda frames, heatmaps: reshape_tensors(
-                frames, heatmaps, args.seq, args.grayscale
-            ),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-        .batch(BATCH_SIZE)
-        .prefetch(tf.data.AUTOTUNE)
-    )
+    # Добавить prefetch для training dataset
+    if args.preload_memory:
+        train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+    else:
+        train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
     
     train_size = tf.data.experimental.cardinality(train_dataset).numpy()
     test_size = tf.data.experimental.cardinality(test_dataset).numpy()
