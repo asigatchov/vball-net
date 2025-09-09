@@ -1,3 +1,4 @@
+from tensorflow import keras
 import tensorflow as tf
 from tensorflow.keras.layers import (
     Input,
@@ -132,8 +133,6 @@ class FusionLayerTypeA(Layer):
             )  # Use attention map of current frame
         return tf.stack(outputs, axis=1)
 
-from tensorflow import keras
-import tensorflow as tf
 def spatial_attention(x):
     # x имеет форму (None, channels, height, width), например (None, 128, 72, 128)
     

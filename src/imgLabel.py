@@ -44,7 +44,7 @@ n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
 if load_csv:
     info = load_info(csv_path)
-    if False and len(info) != n_frames:
+    if  len(info) != n_frames:
         print("Number of frames in video and dictionary are not the same!")
         print("Fail to load, create new dictionary instead.")
         info = {
@@ -56,9 +56,10 @@ if load_csv:
 else:
     print("Create new dictionary")
     info = {
-        idx: {"Frame": idx, "Visibility": 0, "Y": -1, "Y": -1}
+        idx: {"Frame": idx, "Visibility": 0, "X": -1, "Y": -1}
         for idx in range(n_frames)
     }
+import pdb; pdb.set_trace()
 
 # # # # # # # # # # # # # # # #
 # e: exit program             #

@@ -73,6 +73,15 @@ def get_model(model_name, height, width, seq, grayscale=False):
         from model.VballNetV2 import VballNetV2
 
         return VballNetV2(height, width, in_dim=in_dim, out_dim=out_dim)
+
+
+    if model_name == "VballNetV3":
+        from model.VballNetV3 import VballNetV3
+
+
+        return VballNetV3(height, width, in_dim=in_dim, out_dim=out_dim)
+
+
     return VballNetV1(height, width, in_dim=in_dim, out_dim=out_dim)
 
 
