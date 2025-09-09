@@ -94,7 +94,7 @@ def get_preprocessed_data_pairs(dataset_root, mode, seq):
     """
     logger = logging.getLogger(__name__)
     pairs = []
-    
+    dataset_root = os.path.join(dataset_root, mode) 
     if not os.path.exists(dataset_root):
         logger.warning("Dataset root %s does not exist", dataset_root)
         return pairs
@@ -418,7 +418,7 @@ def parser_args():
     parser.add_argument(
         "--dataset_root",
         type=str,
-        default="dataset_preprocessed",
+        default="data",
         help="Root directory of preprocessed dataset (default: dataset_preprocessed).",
     )
     parser.add_argument(
@@ -495,9 +495,9 @@ def main():
     logger.info("Created model save directory: %s", model_save_dir)
     
     # Получить пары данных
-    train_pairs = get_preprocessed_data_pairs(args.dataset_root, "train", args.seq)
-    test_pairs = get_preprocessed_data_pairs(args.dataset_root, "test", args.seq)
-    
+    train_pairs = get_preprocessed_data_pairs(args.dataset_root, "train_preprocessed", args.seq)
+    test_pairs = get_preprocessed_data_pairs(args.dataset_root, "test_preprocessed", args.seq)
+
     logger.info("Number of training pairs: %d", len(train_pairs))
     logger.info("Number of test pairs: %d", len(test_pairs))
     
