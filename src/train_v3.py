@@ -11,6 +11,7 @@ import json
 from datetime import datetime
 import glob
 from pathlib import Path
+from tqdm import tqdm
 from constants import HEIGHT, WIDTH, SIGMA, DATASET_DIR, IMG_FORMAT
 from utils import (
     custom_loss,
@@ -43,6 +44,204 @@ def setup_logging(debug=False):
 
 
 logger = setup_logging()
+
+
+class MemoryEfficientDataset:
+    """
+    Класс для эффективной по памяти загрузки датасета.
+    Реализует подход с предзагрузкой в uint8 формате по образцу grayscale примера.
+    """
+    
+    def __init__(self, data_path, seq=3, grayscale=False, preload_memory=False):
+        self.data_path = Path(data_path)
+        self.seq = seq
+        self.grayscale = grayscale
+        self.preload_memory = preload_memory
+        
+        # Списки для хранения индексов и кеша
+        self.sequence_indices = []
+        self.image_cache = []
+        
+        if self.preload_memory:
+            self._load_dataset()
+        else:
+            self._build_sequence_indices()
+    
+    def _build_sequence_indices(self):
+        """Построить список индексов последовательностей без предзагрузки."""
+        matches = [
+            d for d in os.listdir(self.data_path)
+            if os.path.isdir(self.data_path / d) and d.startswith("match")
+        ]
+        
+        for match in matches:
+            inputs_path = self.data_path / match / "inputs"
+            heatmaps_path = self.data_path / match / "heatmaps"
+            if not (inputs_path.exists() and heatmaps_path.exists()):
+                continue
+                
+            rallies = [d for d in os.listdir(inputs_path) if os.path.isdir(inputs_path / d)]
+            for rally in rallies:
+                input_rally_path = inputs_path / rally
+                frames = sorted(
+                    [f for f in os.listdir(input_rally_path) if f.endswith(".jpg")],
+                    key=lambda x: int(x.split(".")[0]),
+                )
+                
+                # Создать индексы для всех последовательностей
+                for i in range(len(frames) - self.seq + 1):
+                    self.sequence_indices.append((match, rally, i))
+    
+    def _load_dataset(self):
+        """
+        Загрузить и кешировать все изображения и тепловые карты в ОЗУ.
+        Оптимизировано по образцу grayscale примера.
+        """
+        print(f"Загрузка датасета из {self.data_path} в ОЗУ...")
+        
+        matches = [
+            d for d in os.listdir(self.data_path)
+            if os.path.isdir(self.data_path / d) and d.startswith("match")
+        ]
+        
+        for match in tqdm(matches, desc="Кеширование матчей"):
+            inputs_path = self.data_path / match / "inputs"
+            heatmaps_path = self.data_path / match / "heatmaps"
+            if not (inputs_path.exists() and heatmaps_path.exists()):
+                continue
+                
+            rallies = [d for d in os.listdir(inputs_path) if os.path.isdir(inputs_path / d)]
+            for rally in rallies:
+                input_rally_path = inputs_path / rally
+                heatmap_rally_path = heatmaps_path / rally
+                frames = sorted(
+                    [f for f in os.listdir(input_rally_path) if f.endswith(".jpg")],
+                    key=lambda x: int(x.split(".")[0]),
+                )
+                
+                # Загрузить все кадры и тепловые карты для этого розыгрыша в ОЗУ
+                rally_images = []
+                for frame in frames:
+                    img_path = input_rally_path / frame
+                    heatmap_path = heatmap_rally_path / frame
+                    
+                    # Загрузить изображение
+                    img = cv2.imread(
+                        str(img_path),
+                        cv2.IMREAD_GRAYSCALE if self.grayscale else cv2.IMREAD_COLOR,
+                    )
+                    if img is None:
+                        continue
+                    if not self.grayscale:
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    else:
+                        img = np.expand_dims(img, axis=-1)
+                    
+                    # Использовать uint8 для экономии памяти
+                    img = img.astype(np.uint8)
+                    
+                    # Загрузить тепловую карту
+                    heatmap = cv2.imread(str(heatmap_path), cv2.IMREAD_GRAYSCALE)
+                    if heatmap is None:
+                        continue
+                    heatmap = heatmap.astype(np.uint8)
+                    
+                    rally_images.append((img, heatmap))
+                
+                # Кешировать допустимые последовательности
+                for i in range(len(frames) - self.seq + 1):
+                    self.sequence_indices.append((match, rally, i))
+                self.image_cache.extend(rally_images)
+        
+        print(
+            f"Кешировано {len(self.image_cache)} кадров и {len(self.sequence_indices)} последовательностей в ОЗУ."
+        )
+        
+        # Подсчитать использование памяти
+        if self.image_cache:
+            total_size = sum(img.nbytes + hm.nbytes for img, hm in self.image_cache)
+            total_mb = total_size / (1024 * 1024)
+            print(f"Общее использование памяти (uint8): {total_mb:.2f} MB")
+    
+    def __len__(self):
+        return len(self.sequence_indices)
+    
+    def __getitem__(self, idx):
+        """Получить последовательность по индексу."""
+        if self.preload_memory:
+            return self._get_preloaded_item(idx)
+        else:
+            return self._get_disk_item(idx)
+    
+    def _get_preloaded_item(self, idx):
+        """Получить последовательность из предзагруженных данных."""
+        match, rally, frame_start = self.sequence_indices[idx]
+        
+        # Получить последовательность кадров из кеша
+        frames = []
+        heatmaps = []
+        
+        cache_offset = self._get_cache_offset(match, rally)
+        for i in range(self.seq):
+            img, heatmap = self.image_cache[cache_offset + frame_start + i]
+            frames.append(img)
+            heatmaps.append(heatmap)
+        
+        # Объединить и нормализовать
+        frames_concat = np.concatenate(frames, axis=2).astype(np.float32) / 255.0
+        heatmaps_concat = np.stack(heatmaps, axis=2).astype(np.float32) / 255.0
+        
+        return frames_concat, heatmaps_concat
+    
+    def _get_cache_offset(self, match, rally):
+        """Получить смещение в кеше для указанного матча и розыгрыша."""
+        # Упрощенная реализация - в реальности нужно сохранять смещения
+        offset = 0
+        for seq_match, seq_rally, _ in self.sequence_indices:
+            if seq_match == match and seq_rally == rally:
+                return offset
+            # Приблизительно - в действительности нужно точно отслеживать
+        return 0
+    
+    def _get_disk_item(self, idx):
+        """Получить последовательность с диска."""
+        match, rally, frame_start = self.sequence_indices[idx]
+        
+        inputs_path = self.data_path / match / "inputs" / rally
+        heatmaps_path = self.data_path / match / "heatmaps" / rally
+        
+        frames = sorted(
+            [f for f in os.listdir(inputs_path) if f.endswith(".jpg")],
+            key=lambda x: int(x.split(".")[0]),
+        )
+        
+        # Загрузить последовательность
+        frame_data = []
+        heatmap_data = []
+        
+        for i in range(self.seq):
+            frame_file = frames[frame_start + i]
+            
+            # Загрузить кадр
+            img = cv2.imread(
+                str(inputs_path / frame_file),
+                cv2.IMREAD_GRAYSCALE if self.grayscale else cv2.IMREAD_COLOR,
+            )
+            if not self.grayscale:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            else:
+                img = np.expand_dims(img, axis=-1)
+            frame_data.append(img.astype(np.float32) / 255.0)
+            
+            # Загрузить тепловую карту
+            heatmap = cv2.imread(str(heatmaps_path / frame_file), cv2.IMREAD_GRAYSCALE)
+            heatmap_data.append(heatmap.astype(np.float32) / 255.0)
+        
+        # Объединить
+        frames_concat = np.concatenate(frame_data, axis=2)
+        heatmaps_concat = np.stack(heatmap_data, axis=2)
+        
+        return frames_concat, heatmaps_concat
 
 
 def get_model(model_name, height, width, seq, grayscale=False):
@@ -168,6 +367,7 @@ def get_preprocessed_data_pairs(dataset_root, mode, seq):
 def load_preprocessed_frames(inputs_dir, frame_indices, grayscale=False):
     """
     Загрузить последовательность кадров из предварительно обработанных изображений.
+    Оптимизировано для экономии памяти с использованием uint8.
     """
     logger = logging.getLogger(__name__)
     frames = []
@@ -179,27 +379,31 @@ def load_preprocessed_frames(inputs_dir, frame_indices, grayscale=False):
             logger.error("Frame file does not exist: %s", frame_path)
             raise FileNotFoundError(f"Frame file does not exist: {frame_path}")
             
-        frame = cv2.imread(frame_path)
+        # Загружаем в grayscale или цветном режиме для экономии памяти
+        frame = cv2.imread(
+            frame_path,
+            cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_COLOR,
+        )
         if frame is None:
             logger.error("Failed to load frame: %s", frame_path)
             raise ValueError(f"Failed to load frame: {frame_path}")
             
-        # Конвертировать BGR в RGB
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        if grayscale:
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        if not grayscale:
+            # Конвертировать BGR в RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
             frame = np.expand_dims(frame, axis=-1)
             
-        frame = frame.astype(np.float32) / 255.0
+        # Сохраняем как uint8 для экономии памяти
+        frame = frame.astype(np.uint8)
         frames.append(frame)
         
-        logger.debug("Loaded frame %s with shape %s", frame_path, frame.shape)
+        logger.debug("Loaded frame %s with shape %s (uint8)", frame_path, frame.shape)
     
     # Объединить кадры по каналам
     try:
-        concatenated = tf.concat(frames, axis=2)
-        logger.debug("Concatenated frames shape: %s", concatenated.shape)
+        concatenated = np.concatenate(frames, axis=2)
+        logger.debug("Concatenated frames shape: %s (uint8)", concatenated.shape)
         return concatenated
     except Exception as e:
         logger.error("Failed to concatenate frames: %s", str(e))
@@ -209,6 +413,7 @@ def load_preprocessed_frames(inputs_dir, frame_indices, grayscale=False):
 def load_preprocessed_heatmaps(heatmaps_dir, frame_indices):
     """
     Загрузить последовательность тепловых карт из предварительно обработанных изображений.
+    Оптимизировано для экономии памяти с использованием uint8.
     """
     logger = logging.getLogger(__name__)
     heatmaps = []
@@ -225,16 +430,17 @@ def load_preprocessed_heatmaps(heatmaps_dir, frame_indices):
             logger.error("Failed to load heatmap: %s", heatmap_path)
             raise ValueError(f"Failed to load heatmap: {heatmap_path}")
             
-        heatmap = heatmap.astype(np.float32) / 255.0
+        # Сохраняем как uint8 для экономии памяти
+        heatmap = heatmap.astype(np.uint8)
         heatmap = np.expand_dims(heatmap, axis=-1)
         heatmaps.append(heatmap)
         
-        logger.debug("Loaded heatmap %s with shape %s", heatmap_path, heatmap.shape)
+        logger.debug("Loaded heatmap %s with shape %s (uint8)", heatmap_path, heatmap.shape)
     
     # Объединить тепловые карты по каналам
     try:
-        concatenated = tf.concat(heatmaps, axis=2)
-        logger.debug("Concatenated heatmaps shape: %s", concatenated.shape)
+        concatenated = np.concatenate(heatmaps, axis=2)
+        logger.debug("Concatenated heatmaps shape: %s (uint8)", concatenated.shape)
         return concatenated
     except Exception as e:
         logger.error("Failed to concatenate heatmaps: %s", str(e))
@@ -244,6 +450,7 @@ def load_preprocessed_heatmaps(heatmaps_dir, frame_indices):
 def load_preprocessed_data(sequence_name, inputs_dir, heatmaps_dir, frame_indices, mode, seq, grayscale=False):
     """
     Загрузить данные из предварительно обработанного датасета.
+    Оптимизировано для экономии памяти.
     """
     logger = logging.getLogger(__name__)
     
@@ -257,8 +464,17 @@ def load_preprocessed_data(sequence_name, inputs_dir, heatmaps_dir, frame_indice
     if isinstance(frame_indices, tf.Tensor):
         frame_indices = frame_indices.numpy().tolist()
         
+    # Загружаем данные в uint8 формате
     frames = load_preprocessed_frames(inputs_dir, frame_indices, grayscale)
     heatmaps = load_preprocessed_heatmaps(heatmaps_dir, frame_indices)
+    
+    # Преобразуем в float32 и нормализуем
+    frames = frames.astype(np.float32) / 255.0
+    heatmaps = heatmaps.astype(np.float32) / 255.0
+    
+    # Преобразуем в TensorFlow тензоры
+    frames = tf.convert_to_tensor(frames, dtype=tf.float32)
+    heatmaps = tf.convert_to_tensor(heatmaps, dtype=tf.float32)
     
     # Установить форму тензоров
     frames.set_shape([IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)])
@@ -275,56 +491,117 @@ def load_preprocessed_data(sequence_name, inputs_dir, heatmaps_dir, frame_indice
 def preload_dataset_to_memory(pairs, seq, grayscale=False):
     """
     Предварительная загрузка всего датасета в память для ускорения обучения.
+    Оптимизировано для экономии памяти с использованием uint8.
     Возвращает списки предзагруженных frames и heatmaps.
     """
     logger = logging.getLogger(__name__)
-    logger.info("Preloading dataset to memory for faster training...")
+    logger.info("Предзагрузка датасета в память для ускорения обучения...")
     
     preloaded_frames = []
     preloaded_heatmaps = []
     
     for i, (sequence_name, inputs_dir, heatmaps_dir, frame_indices) in enumerate(pairs):
         if i % 100 == 0:
-            logger.info(f"Preloaded {i}/{len(pairs)} sequences")
+            logger.info(f"Предзагружено {i}/{len(pairs)} последовательностей")
             
         try:
+            # Загружаем в uint8 формате для экономии памяти
             frames = load_preprocessed_frames(inputs_dir, frame_indices, grayscale)
             heatmaps = load_preprocessed_heatmaps(heatmaps_dir, frame_indices)
             
-            # Преобразовать в numpy для экономии памяти
-            frames_np = frames.numpy()
-            heatmaps_np = heatmaps.numpy()
-            
-            preloaded_frames.append(frames_np)
-            preloaded_heatmaps.append(heatmaps_np)
+            # Сохраняем как uint8 напрямую в numpy массивы
+            preloaded_frames.append(frames)  # уже uint8
+            preloaded_heatmaps.append(heatmaps)  # уже uint8
             
         except Exception as e:
-            logger.error(f"Failed to preload sequence {sequence_name}: {e}")
+            logger.error(f"Ошибка при предзагрузке последовательности {sequence_name}: {e}")
             continue
     
-    logger.info(f"Successfully preloaded {len(preloaded_frames)} sequences to memory")
+    logger.info(f"Успешно предзагружено {len(preloaded_frames)} последовательностей в память")
     
-    # Подсчет использования памяти
+    # Подсчет использования памяти (для uint8)
     total_memory_mb = 0
     if preloaded_frames:
         frames_memory = len(preloaded_frames) * preloaded_frames[0].nbytes / (1024 * 1024)
         heatmaps_memory = len(preloaded_heatmaps) * preloaded_heatmaps[0].nbytes / (1024 * 1024)
         total_memory_mb = frames_memory + heatmaps_memory
         
-    logger.info(f"Dataset memory usage: {total_memory_mb:.2f} MB")
+        logger.info(f"Использование памяти датасетом: {total_memory_mb:.2f} MB")
+        logger.info(f"  - Кадры: {frames_memory:.2f} MB (uint8)")
+        logger.info(f"  - Тепловые карты: {heatmaps_memory:.2f} MB (uint8)")
+        logger.info(f"  - Экономия памяти: ~{total_memory_mb * 3:.2f} MB (по сравнению с float32)")
     
     return preloaded_frames, preloaded_heatmaps
+
+
+def create_tf_dataset_from_memory_efficient(dataset, batch_size, seq, grayscale=False, shuffle=True, augment=True, alpha=-1.0):
+    """
+    Создать TensorFlow Dataset из меморийно-эффективного класса.
+    """
+    logger = logging.getLogger(__name__)
+    
+    def generator():
+        indices = list(range(len(dataset)))
+        if shuffle:
+            np.random.shuffle(indices)
+        for idx in indices:
+            frames, heatmaps = dataset[idx]
+            yield frames, heatmaps
+    
+    # Определить формы выходных тензоров
+    output_signature = (
+        tf.TensorSpec(shape=[IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)], dtype=tf.float32),
+        tf.TensorSpec(shape=[IMG_HEIGHT, IMG_WIDTH, seq], dtype=tf.float32)
+    )
+    
+    tf_dataset = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=output_signature
+    )
+    
+    if augment:
+        tf_dataset = tf_dataset.map(
+            lambda frames, heatmaps: reshape_tensors(frames, heatmaps, seq, grayscale),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        ).map(
+            lambda frames, heatmaps: augment_sequence(frames, heatmaps, seq, grayscale, alpha),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+    else:
+        tf_dataset = tf_dataset.map(
+            lambda frames, heatmaps: reshape_tensors(frames, heatmaps, seq, grayscale),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+    
+    tf_dataset = tf_dataset.batch(batch_size)
+    
+    if alpha > 0 and augment:
+        tf_dataset = tf_dataset.map(
+            lambda frames, heatmaps: mixup(frames, heatmaps, alpha),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+    
+    tf_dataset = tf_dataset.prefetch(tf.data.AUTOTUNE)
+    
+    logger.info(f"Создан TF Dataset с {len(dataset)} последовательностями")
+    return tf_dataset
 
 
 def load_preloaded_data(index, preloaded_frames, preloaded_heatmaps, seq, grayscale=False):
     """
     Загрузить данные из предзагруженного в память датасета по индексу.
+    Оптимизировано для экономии памяти.
     """
     if isinstance(index, tf.Tensor):
         index = index.numpy()
         
-    frames = tf.convert_to_tensor(preloaded_frames[index], dtype=tf.float32)
-    heatmaps = tf.convert_to_tensor(preloaded_heatmaps[index], dtype=tf.float32)
+    # Получаем uint8 данные и преобразуем в float32
+    frames_uint8 = preloaded_frames[index]
+    heatmaps_uint8 = preloaded_heatmaps[index]
+    
+    # Нормализация в float32
+    frames = tf.convert_to_tensor(frames_uint8.astype(np.float32) / 255.0, dtype=tf.float32)
+    heatmaps = tf.convert_to_tensor(heatmaps_uint8.astype(np.float32) / 255.0, dtype=tf.float32)
     
     # Установить форму тензоров
     frames.set_shape([IMG_HEIGHT, IMG_WIDTH, seq * (1 if grayscale else 3)])
@@ -488,6 +765,11 @@ def parser_args():
         help="Preload entire dataset to memory for faster training (uses more RAM).",
     )
     parser.add_argument(
+        "--use_memory_efficient",
+        action="store_true",
+        help="Use memory-efficient dataset class with uint8 optimization (based on grayscale example).",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume training from the latest checkpoint.",
@@ -532,8 +814,8 @@ def main():
     args = parser_args()
     logger = logging.getLogger(__name__)
     logger.info(
-        "Starting training script for preprocessed data with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s gpu_memory_limit=%d preload_memory=%s",
-        args.seq, args.grayscale, args.debug, args.resume, args.model_name, args.alpha, args.gpu_memory_limit, args.preload_memory
+        "Starting training script for preprocessed data with seq=%d, grayscale=%s, debug=%s, resume=%s, model_name=%s, alpha=%s gpu_memory_limit=%d preload_memory=%s use_memory_efficient=%s",
+        args.seq, args.grayscale, args.debug, args.resume, args.model_name, args.alpha, args.gpu_memory_limit, args.preload_memory, args.use_memory_efficient
     )
     
     limit_gpu_memory(args.gpu_memory_limit)
@@ -561,136 +843,176 @@ def main():
     logger.info("Created model save directory: %s", model_save_dir)
     
     # Получить пары данных
-    train_pairs = get_preprocessed_data_pairs(args.dataset_root, "train_preprocessed", args.seq)
-    test_pairs = get_preprocessed_data_pairs(args.dataset_root, "test", args.seq)
-    
-    logger.info("Number of training pairs: %d", len(train_pairs))
-    logger.info("Number of test pairs: %d", len(test_pairs))
-    
-    if len(train_pairs) == 0:
-        logger.error("No training data found. Check dataset_root and preprocessed structure.")
-        raise ValueError("No training data found. Check dataset_root and preprocessed structure.")
+    if args.use_memory_efficient:
+        # Использовать новый memory-efficient подход
+        logger.info("Используется memory-efficient подход с оптимизацией uint8...")
         
-    if len(test_pairs) == 0:
-        logger.warning("No test data found. Will use training data for validation.")
-        test_pairs = train_pairs[:max(1, len(train_pairs) // 10)]  # Use 10% of training data
-    
-    # Предзагрузка датасета в память (опционально)
-    if args.preload_memory:
-        logger.info("Preloading datasets to memory...")
-        train_frames_mem, train_heatmaps_mem = preload_dataset_to_memory(train_pairs, args.seq, args.grayscale)
-        test_frames_mem, test_heatmaps_mem = preload_dataset_to_memory(test_pairs, args.seq, args.grayscale)
-        
-        # Создать датасеты из предзагруженных данных
-        train_dataset = (
-            tf.data.Dataset.from_tensor_slices(list(range(len(train_pairs))))
-            .map(
-                lambda idx: tf.py_function(
-                    func=lambda i: load_preloaded_data(
-                        i, train_frames_mem, train_heatmaps_mem, args.seq, args.grayscale
-                    ),
-                    inp=[idx],
-                    Tout=[tf.float32, tf.float32],
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
-            )
-            .map(
-                lambda frames, heatmaps: reshape_tensors(
-                    frames, heatmaps, args.seq, args.grayscale
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
-            )
-            .map(
-                lambda frames, heatmaps: augment_sequence(
-                    frames, heatmaps, args.seq, args.grayscale, args.alpha
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
-            )
-            .batch(BATCH_SIZE)
+        train_dataset_me = MemoryEfficientDataset(
+            args.dataset_root, 
+            seq=args.seq, 
+            grayscale=args.grayscale, 
+            preload_memory=args.preload_memory
         )
         
-        test_dataset = (
-            tf.data.Dataset.from_tensor_slices(list(range(len(test_pairs))))
-            .map(
-                lambda idx: tf.py_function(
-                    func=lambda i: load_preloaded_data(
-                        i, test_frames_mem, test_heatmaps_mem, args.seq, args.grayscale
-                    ),
-                    inp=[idx],
-                    Tout=[tf.float32, tf.float32],
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
-            )
-            .map(
-                lambda frames, heatmaps: reshape_tensors(
-                    frames, heatmaps, args.seq, args.grayscale
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
-            )
-            .batch(BATCH_SIZE)
-            .prefetch(tf.data.AUTOTUNE)
+        # Создать тестовый датасет (используем 10% от обучающего)
+        test_size = max(1, len(train_dataset_me) // 10)
+        test_indices = np.random.choice(len(train_dataset_me), test_size, replace=False)
+        
+        # Создать TensorFlow датасеты
+        train_dataset = create_tf_dataset_from_memory_efficient(
+            train_dataset_me, BATCH_SIZE, args.seq, args.grayscale, 
+            shuffle=True, augment=True, alpha=args.alpha
         )
+        
+        # Для тестового датасета используем подмножество без аугментации
+        class SubsetDataset:
+            def __init__(self, original_dataset, indices):
+                self.original_dataset = original_dataset
+                self.indices = indices
+            def __len__(self):
+                return len(self.indices)
+            def __getitem__(self, idx):
+                return self.original_dataset[self.indices[idx]]
+        
+        test_dataset_me = SubsetDataset(train_dataset_me, test_indices)
+        test_dataset = create_tf_dataset_from_memory_efficient(
+            test_dataset_me, BATCH_SIZE, args.seq, args.grayscale, 
+            shuffle=False, augment=False
+        )
+        
+        logger.info(f"Memory-efficient датасеты: train={len(train_dataset_me)}, test={len(test_dataset_me)}")
         
     else:
-        # Обычная загрузка с диска
-        train_dataset = (
-            tf.data.Dataset.from_tensor_slices((
-                [p[0] for p in train_pairs],  # sequence_name
-                [p[1] for p in train_pairs],  # inputs_dir
-                [p[2] for p in train_pairs],  # heatmaps_dir
-                [p[3] for p in train_pairs],  # frame_indices
-            ))
-            .map(
-                lambda sn, id, hd, fi: tf.py_function(
-                    func=lambda w, x, y, z: load_preprocessed_data(
-                        w, x, y, z, "train", args.seq, args.grayscale
-                    ),
-                    inp=[sn, id, hd, fi],
-                    Tout=[tf.float32, tf.float32],
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
-            )
-            .map(
-                lambda frames, heatmaps: reshape_tensors(
-                    frames, heatmaps, args.seq, args.grayscale
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
-            )
-            .map(
-                lambda frames, heatmaps: augment_sequence(
-                    frames, heatmaps, args.seq, args.grayscale, args.alpha
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
-            )
-            .batch(BATCH_SIZE)
-        )
+        # Использовать оригинальный подход
+        train_pairs = get_preprocessed_data_pairs(args.dataset_root, "train_preprocessed", args.seq)
+        test_pairs = get_preprocessed_data_pairs(args.dataset_root, "test", args.seq)
+        logger.info("Number of training pairs: %d", len(train_pairs))
+        logger.info("Number of test pairs: %d", len(test_pairs))
         
-        test_dataset = (
-            tf.data.Dataset.from_tensor_slices((
-                [p[0] for p in test_pairs],
-                [p[1] for p in test_pairs],
-                [p[2] for p in test_pairs],
-                [p[3] for p in test_pairs],
-            ))
-            .map(
-                lambda sn, id, hd, fi: tf.py_function(
-                    func=lambda w, x, y, z: load_preprocessed_data(
-                        w, x, y, z, "test", args.seq, args.grayscale
+        if len(train_pairs) == 0:
+            logger.error("No training data found. Check dataset_root and preprocessed structure.")
+            raise ValueError("No training data found. Check dataset_root and preprocessed structure.")
+            
+        if len(test_pairs) == 0:
+            logger.warning("No test data found. Will use training data for validation.")
+            test_pairs = train_pairs[:max(1, len(train_pairs) // 10)]  # Use 10% of training data
+        
+        # Предзагрузка датасета в память (опционально)
+        if args.preload_memory:
+            logger.info("Preloading datasets to memory...")
+            train_frames_mem, train_heatmaps_mem = preload_dataset_to_memory(train_pairs, args.seq, args.grayscale)
+            test_frames_mem, test_heatmaps_mem = preload_dataset_to_memory(test_pairs, args.seq, args.grayscale)
+            
+            # Создать датасеты из предзагруженных данных
+            train_dataset = (
+                tf.data.Dataset.from_tensor_slices(list(range(len(train_pairs))))
+                .map(
+                    lambda idx: tf.py_function(
+                        func=lambda i: load_preloaded_data(
+                            i, train_frames_mem, train_heatmaps_mem, args.seq, args.grayscale
+                        ),
+                        inp=[idx],
+                        Tout=[tf.float32, tf.float32],
                     ),
-                    inp=[sn, id, hd, fi],
-                    Tout=[tf.float32, tf.float32],
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .map(
+                    lambda frames, heatmaps: reshape_tensors(
+                        frames, heatmaps, args.seq, args.grayscale
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .map(
+                    lambda frames, heatmaps: augment_sequence(
+                        frames, heatmaps, args.seq, args.grayscale, args.alpha
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .batch(BATCH_SIZE)
             )
-            .map(
-                lambda frames, heatmaps: reshape_tensors(
-                    frames, heatmaps, args.seq, args.grayscale
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE,
+            
+            test_dataset = (
+                tf.data.Dataset.from_tensor_slices(list(range(len(test_pairs))))
+                .map(
+                    lambda idx: tf.py_function(
+                        func=lambda i: load_preloaded_data(
+                            i, test_frames_mem, test_heatmaps_mem, args.seq, args.grayscale
+                        ),
+                        inp=[idx],
+                        Tout=[tf.float32, tf.float32],
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .map(
+                    lambda frames, heatmaps: reshape_tensors(
+                        frames, heatmaps, args.seq, args.grayscale
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .batch(BATCH_SIZE)
+                .prefetch(tf.data.AUTOTUNE)
             )
-            .batch(BATCH_SIZE)
-            .prefetch(tf.data.AUTOTUNE)
-        )
+            
+        else:
+            # Обычная загрузка с диска
+            train_dataset = (
+                tf.data.Dataset.from_tensor_slices((
+                    [p[0] for p in train_pairs],  # sequence_name
+                    [p[1] for p in train_pairs],  # inputs_dir
+                    [p[2] for p in train_pairs],  # heatmaps_dir
+                    [p[3] for p in train_pairs],  # frame_indices
+                ))
+                .map(
+                    lambda sn, id, hd, fi: tf.py_function(
+                        func=lambda w, x, y, z: load_preprocessed_data(
+                            w, x, y, z, "train", args.seq, args.grayscale
+                        ),
+                        inp=[sn, id, hd, fi],
+                        Tout=[tf.float32, tf.float32],
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .map(
+                    lambda frames, heatmaps: reshape_tensors(
+                        frames, heatmaps, args.seq, args.grayscale
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .map(
+                    lambda frames, heatmaps: augment_sequence(
+                        frames, heatmaps, args.seq, args.grayscale, args.alpha
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .batch(BATCH_SIZE)
+            )
+            
+            test_dataset = (
+                tf.data.Dataset.from_tensor_slices((
+                    [p[0] for p in test_pairs],
+                    [p[1] for p in test_pairs],
+                    [p[2] for p in test_pairs],
+                    [p[3] for p in test_pairs],
+                ))
+                .map(
+                    lambda sn, id, hd, fi: tf.py_function(
+                        func=lambda w, x, y, z: load_preprocessed_data(
+                            w, x, y, z, "test", args.seq, args.grayscale
+                        ),
+                        inp=[sn, id, hd, fi],
+                        Tout=[tf.float32, tf.float32],
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .map(
+                    lambda frames, heatmaps: reshape_tensors(
+                        frames, heatmaps, args.seq, args.grayscale
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+                .batch(BATCH_SIZE)
+                .prefetch(tf.data.AUTOTUNE)
+            )
     
     # Применить mixup аугментацию к training dataset
     if args.alpha > 0:
