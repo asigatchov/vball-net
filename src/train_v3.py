@@ -12,6 +12,9 @@ from datetime import datetime
 import glob
 from pathlib import Path
 from tqdm import tqdm
+import gc
+import psutil
+from collections import OrderedDict
 from constants import HEIGHT, WIDTH, SIGMA, DATASET_DIR, IMG_FORMAT
 from utils import (
     custom_loss,
@@ -46,18 +49,186 @@ def setup_logging(debug=False):
 logger = setup_logging()
 
 
+class VRAMCache:
+    """
+    Intelligent VRAM caching system for accelerated data loading.
+    Implements LRU (Least Recently Used) eviction policy with smart memory management.
+    """
+    
+    def __init__(self, max_vram_mb=1024, cache_hit_threshold=2):
+        """
+        Args:
+            max_vram_mb: Maximum VRAM to use for caching (MB)
+            cache_hit_threshold: Minimum hits before caching to VRAM
+        """
+        self.max_vram_bytes = max_vram_mb * 1024 * 1024
+        self.cache_hit_threshold = cache_hit_threshold
+        self.vram_cache = OrderedDict()  # LRU cache for VRAM
+        self.access_counts = {}  # Track access frequency
+        self.current_vram_usage = 0
+        self.logger = logging.getLogger(__name__)
+        
+        # Check GPU availability
+        self.gpu_available = len(tf.config.list_physical_devices('GPU')) > 0
+        if not self.gpu_available:
+            self.logger.warning("No GPU available, VRAM caching disabled")
+            self.max_vram_bytes = 0
+        else:
+            self.logger.info(f"VRAM cache initialized: {max_vram_mb}MB max, threshold={cache_hit_threshold}")
+    
+    def _estimate_tensor_size(self, tensor_shape, dtype=tf.float32):
+        """Estimate tensor size in bytes"""
+        if dtype == tf.float32:
+            bytes_per_element = 4
+        elif dtype == tf.uint8:
+            bytes_per_element = 1
+        elif dtype == tf.float16:
+            bytes_per_element = 2
+        else:
+            bytes_per_element = 4  # Default assumption
+        
+        total_elements = 1
+        for dim in tensor_shape:
+            total_elements *= dim
+        return total_elements * bytes_per_element
+    
+    def _evict_lru_items(self, required_bytes):
+        """Evict least recently used items to free up VRAM"""
+        evicted_keys = []
+        freed_bytes = 0
+        
+        # Evict from least recently used (beginning of OrderedDict)
+        while self.current_vram_usage + required_bytes > self.max_vram_bytes and self.vram_cache:
+            key, (tensor_frames, tensor_heatmaps) = self.vram_cache.popitem(last=False)
+            
+            # Calculate freed memory
+            frames_size = self._estimate_tensor_size(tensor_frames.shape, tensor_frames.dtype)
+            heatmaps_size = self._estimate_tensor_size(tensor_heatmaps.shape, tensor_heatmaps.dtype)
+            item_size = frames_size + heatmaps_size
+            
+            self.current_vram_usage -= item_size
+            freed_bytes += item_size
+            evicted_keys.append(key)
+            
+            # Explicitly delete tensors to free GPU memory
+            del tensor_frames, tensor_heatmaps
+        
+        if evicted_keys:
+            self.logger.debug(f"Evicted {len(evicted_keys)} items from VRAM, freed {freed_bytes/1024/1024:.2f}MB")
+        
+        # Force garbage collection
+        gc.collect()
+        if self.gpu_available:
+            try:
+                tf.keras.backend.clear_session()
+            except:
+                pass
+    
+    def should_cache(self, key):
+        """Determine if item should be cached in VRAM based on access frequency"""
+        if not self.gpu_available or self.max_vram_bytes == 0:
+            return False
+        
+        self.access_counts[key] = self.access_counts.get(key, 0) + 1
+        return self.access_counts[key] >= self.cache_hit_threshold
+    
+    def get(self, key):
+        """Get item from VRAM cache"""
+        if key in self.vram_cache:
+            # Move to end (most recently used)
+            item = self.vram_cache.pop(key)
+            self.vram_cache[key] = item
+            return item
+        return None
+    
+    def put(self, key, frames_np, heatmaps_np):
+        """Put item in VRAM cache with intelligent memory management"""
+        if not self.gpu_available or self.max_vram_bytes == 0:
+            return False
+        
+        if not self.should_cache(key):
+            return False
+        
+        try:
+            # Convert to GPU tensors
+            with tf.device('/GPU:0'):
+                tensor_frames = tf.convert_to_tensor(frames_np, dtype=tf.uint8)
+                tensor_heatmaps = tf.convert_to_tensor(heatmaps_np, dtype=tf.uint8)
+            
+            # Calculate required memory
+            frames_size = self._estimate_tensor_size(tensor_frames.shape, tensor_frames.dtype)
+            heatmaps_size = self._estimate_tensor_size(tensor_heatmaps.shape, tensor_heatmaps.dtype)
+            required_bytes = frames_size + heatmaps_size
+            
+            # Check if we need to evict items
+            if self.current_vram_usage + required_bytes > self.max_vram_bytes:
+                self._evict_lru_items(required_bytes)
+            
+            # Check if we still have enough space
+            if self.current_vram_usage + required_bytes <= self.max_vram_bytes:
+                # Remove existing item if present
+                if key in self.vram_cache:
+                    old_frames, old_heatmaps = self.vram_cache[key]
+                    old_size = (self._estimate_tensor_size(old_frames.shape, old_frames.dtype) + 
+                               self._estimate_tensor_size(old_heatmaps.shape, old_heatmaps.dtype))
+                    self.current_vram_usage -= old_size
+                    del old_frames, old_heatmaps
+                
+                # Add new item
+                self.vram_cache[key] = (tensor_frames, tensor_heatmaps)
+                self.current_vram_usage += required_bytes
+                
+                self.logger.debug(f"Cached {key} in VRAM ({required_bytes/1024/1024:.2f}MB), total: {self.current_vram_usage/1024/1024:.2f}MB")
+                return True
+            else:
+                # Not enough space even after eviction
+                del tensor_frames, tensor_heatmaps
+                return False
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to cache {key} in VRAM: {e}")
+            return False
+    
+    def get_stats(self):
+        """Get cache statistics"""
+        return {
+            'vram_usage_mb': self.current_vram_usage / 1024 / 1024,
+            'max_vram_mb': self.max_vram_bytes / 1024 / 1024,
+            'cached_items': len(self.vram_cache),
+            'cache_utilization': (self.current_vram_usage / max(self.max_vram_bytes, 1)) * 100,
+            'total_accesses': sum(self.access_counts.values()),
+            'unique_keys': len(self.access_counts)
+        }
+    
+    def clear(self):
+        """Clear all cached items"""
+        self.vram_cache.clear()
+        self.access_counts.clear()
+        self.current_vram_usage = 0
+        gc.collect()
+        if self.gpu_available:
+            try:
+                tf.keras.backend.clear_session()
+            except:
+                pass
+
+
 class MemoryEfficientDataset:
     """
     Класс для эффективной по памяти загрузки датасета.
     Реализует подход с предзагрузкой в uint8 формате по образцу grayscale примера.
+    Поддерживает VRAM кеширование для ускорения обучения.
     """
 
-    def __init__(self, data_path, seq=3, grayscale=False, preload_memory=False):
+    def __init__(self, data_path, seq=3, grayscale=False, preload_memory=False, vram_cache_mb=1024):
         self.data_path = Path(data_path)
         self.seq = seq
         self.grayscale = grayscale
         self.preload_memory = preload_memory
-
+        
+        # Инициализация VRAM кеша
+        self.vram_cache = VRAMCache(max_vram_mb=vram_cache_mb, cache_hit_threshold=2)
+        
         # Списки для хранения индексов и кеша
         self.sequence_indices = []
         self.image_cache = []
@@ -167,31 +338,114 @@ class MemoryEfficientDataset:
         return len(self.sequence_indices)
 
     def __getitem__(self, idx):
-        """Получить последовательность по индексу."""
+        """Получить последовательность по индексу с VRAM кешированием."""
         if self.preload_memory:
-            return self._get_preloaded_item(idx)
+            return self._get_preloaded_item_with_vram(idx)
         else:
-            return self._get_disk_item(idx)
+            return self._get_disk_item_with_vram(idx)
 
-    def _get_preloaded_item(self, idx):
-        """Получить последовательность из предзагруженных данных."""
+    def _get_preloaded_item_with_vram(self, idx):
+        """Получить последовательность из предзагруженных данных с VRAM кешированием."""
         match, rally, frame_start = self.sequence_indices[idx]
-
-        # Получить последовательность кадров из кеша
+        cache_key = f"{match}_{rally}_{frame_start}"
+        
+        # Проверить VRAM кеш
+        vram_data = self.vram_cache.get(cache_key)
+        if vram_data is not None:
+            # Получить данные из VRAM и нормализовать
+            vram_frames, vram_heatmaps = vram_data
+            frames = tf.cast(vram_frames, tf.float32) / 255.0
+            heatmaps = tf.cast(vram_heatmaps, tf.float32) / 255.0
+            return frames.numpy(), heatmaps.numpy()
+        
+        # Получить данные из ОЗУ кеша
         frames = []
         heatmaps = []
-
+        
         cache_offset = self._get_cache_offset(match, rally)
         for i in range(self.seq):
             img, heatmap = self.image_cache[cache_offset + frame_start + i]
             frames.append(img)
             heatmaps.append(heatmap)
-
-        # Объединить и нормализовать
-        frames_concat = np.concatenate(frames, axis=2).astype(np.float32) / 255.0
-        heatmaps_concat = np.stack(heatmaps, axis=2).astype(np.float32) / 255.0
-
-        return frames_concat, heatmaps_concat
+        
+        # Объединить в uint8 формате
+        frames_concat = np.concatenate(frames, axis=2)
+        heatmaps_concat = np.stack(heatmaps, axis=2)
+        
+        # Попытаться кешировать в VRAM
+        self.vram_cache.put(cache_key, frames_concat, heatmaps_concat)
+        
+        # Нормализовать и вернуть
+        frames_normalized = frames_concat.astype(np.float32) / 255.0
+        heatmaps_normalized = heatmaps_concat.astype(np.float32) / 255.0
+        
+        return frames_normalized, heatmaps_normalized
+    
+    def _get_disk_item_with_vram(self, idx):
+        """Получить последовательность с диска с VRAM кешированием."""
+        match, rally, frame_start = self.sequence_indices[idx]
+        cache_key = f"{match}_{rally}_{frame_start}"
+        
+        # Проверить VRAM кеш
+        vram_data = self.vram_cache.get(cache_key)
+        if vram_data is not None:
+            # Получить данные из VRAM и нормализовать
+            vram_frames, vram_heatmaps = vram_data
+            frames = tf.cast(vram_frames, tf.float32) / 255.0
+            heatmaps = tf.cast(vram_heatmaps, tf.float32) / 255.0
+            return frames.numpy(), heatmaps.numpy()
+        
+        # Загрузить с диска
+        inputs_path = self.data_path / match / "inputs" / rally
+        heatmaps_path = self.data_path / match / "heatmaps" / rally
+        
+        frames = sorted(
+            [f for f in os.listdir(inputs_path) if f.endswith(".jpg")],
+            key=lambda x: int(x.split(".")[0]),
+        )
+        
+        # Загрузить последовательность в uint8
+        frame_data = []
+        heatmap_data = []
+        
+        for i in range(self.seq):
+            frame_file = frames[frame_start + i]
+            
+            # Загрузить кадр
+            img = cv2.imread(
+                str(inputs_path / frame_file),
+                cv2.IMREAD_GRAYSCALE if self.grayscale else cv2.IMREAD_COLOR,
+            )
+            if not self.grayscale:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            else:
+                img = np.expand_dims(img, axis=-1)
+            frame_data.append(img.astype(np.uint8))
+            
+            # Загрузить тепловую карту
+            heatmap = cv2.imread(str(heatmaps_path / frame_file), cv2.IMREAD_GRAYSCALE)
+            heatmap_data.append(heatmap.astype(np.uint8))
+        
+        # Объединить
+        frames_concat = np.concatenate(frame_data, axis=2)
+        heatmaps_concat = np.stack(heatmap_data, axis=2)
+        
+        # Попытаться кешировать в VRAM
+        self.vram_cache.put(cache_key, frames_concat, heatmaps_concat)
+        
+        # Нормализовать и вернуть
+        frames_normalized = frames_concat.astype(np.float32) / 255.0
+        heatmaps_normalized = heatmaps_concat.astype(np.float32) / 255.0
+        
+        return frames_normalized, heatmaps_normalized
+    
+    def get_vram_stats(self):
+        """Получить статистику VRAM кеша."""
+        return self.vram_cache.get_stats()
+    
+    def clear_vram_cache(self):
+        """Очистить VRAM кеш."""
+        self.vram_cache.clear()
 
     def _get_cache_offset(self, match, rally):
         """Получить смещение в кеше для указанного матча и розыгрыша."""
@@ -770,6 +1024,12 @@ def parser_args():
         help="Use memory-efficient dataset class with uint8 optimization (based on grayscale example).",
     )
     parser.add_argument(
+        "--vram_cache_mb",
+        type=int,
+        default=1024,
+        help="VRAM cache size in MB for accelerated data loading (default: 1024).",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume training from the latest checkpoint.",
@@ -851,7 +1111,8 @@ def main():
             args.dataset_root,
             seq=args.seq,
             grayscale=args.grayscale,
-            preload_memory=args.preload_memory
+            preload_memory=args.preload_memory,
+            vram_cache_mb=args.vram_cache_mb
         )
 
         # Создать тестовый датасет (используем 10% от обучающего)
@@ -881,6 +1142,10 @@ def main():
         )
 
         logger.info(f"Memory-efficient датасеты: train={len(train_dataset_me)}, test={len(test_dataset_me)}")
+        
+        # Логировать статистику VRAM кеша
+        vram_stats = train_dataset_me.get_vram_stats()
+        logger.info(f"VRAM Cache initialized: {vram_stats['max_vram_mb']:.1f}MB max, {vram_stats['cached_items']} items cached")
 
     else:
         # Использовать оригинальный подход
@@ -1120,6 +1385,62 @@ def main():
             current_lr = self.lr_schedule(current_step).numpy()
             logger.info(f"Epoch {epoch + 1}: Learning rate = {current_lr}")
 
+    class VRAMStatsLogger(tf.keras.callbacks.Callback):
+        def __init__(self, dataset_with_vram_cache):
+            super().__init__()
+            self.dataset = dataset_with_vram_cache
+            
+        def on_epoch_end(self, epoch, logs=None):
+            if hasattr(self.dataset, 'get_vram_stats'):
+                stats = self.dataset.get_vram_stats()
+                logger.info(
+                    f"VRAM Cache Stats - Usage: {stats['vram_usage_mb']:.1f}/{stats['max_vram_mb']:.1f}MB "
+                    f"({stats['cache_utilization']:.1f}%), Items: {stats['cached_items']}, "
+                    f"Accesses: {stats['total_accesses']}"
+                )
+
+    # Настроить callbacks
+    callbacks = [
+        # Сохранение последней контрольной точки
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=latest_checkpoint_path,
+            save_best_only=False,
+            save_weights_only=False,
+            monitor="val_loss",
+            verbose=1,
+        ),
+        # Сохранение лучшей контрольной точки по val_loss
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=best_checkpoint_path,
+            save_best_only=True,
+            save_weights_only=False,
+            monitor="val_loss",
+            mode="min",
+            verbose=1,
+        ),
+        # Сохранение контрольной точки для каждой эпохи
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=epoch_checkpoint_path,
+            save_best_only=False,
+            save_weights_only=False,
+            monitor="val_loss",
+            verbose=1,
+        ),
+        tf.keras.callbacks.TensorBoard(
+            log_dir=os.path.join(MODEL_DIR, "logs", model_save_name)
+        ),
+        tf.keras.callbacks.EarlyStopping(patience=30, monitor="val_loss"),
+        OutcomeMetricsCallback(
+            validation_data=test_dataset,
+            tol=10,
+            log_dir=os.path.join(MODEL_DIR, "logs", f"{model_save_name}/outcome"),
+        ),
+        LearningRateLogger(lr_schedule, train_size),
+    ]
+    
+    # Добавить VRAM статистику для memory-efficient подхода
+    if args.use_memory_efficient:
+        callbacks.append(VRAMStatsLogger(train_dataset_me))
     # Настроить callbacks
     callbacks = [
         # Сохранение последней контрольной точки
